@@ -1,9 +1,17 @@
 {
   "name": "pi-loadout",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "description": "Interactive tool loadouts for Pi sessions.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/tianrendong/pi-loadout.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tianrendong/pi-loadout/issues"
+  },
+  "homepage": "https://github.com/tianrendong/pi-loadout#readme",
   "keywords": [
     "pi-package",
     "pi",
