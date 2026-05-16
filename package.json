@@ -1,0 +1,28 @@
+{
+  "name": "pi-loadout",
+  "version": "0.0.12",
+  "description": "Interactive tool loadouts for Pi sessions.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "tools",
+    "loadout"
+  ],
+  "files": [
+    "README.md",
+    "LICENSE",
+    "extensions"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
