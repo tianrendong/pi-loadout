@@ -249,6 +249,14 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     );
   }
 
+  function isLoadoutLogItem(item: unknown): boolean {
+    return (item as { customType?: string }).customType === LOG_CUSTOM_TYPE;
+  }
+
+  function filterLoadoutLogItemsInPlace<T>(items: T[]) {
+    items.splice(0, items.length, ...items.filter((item) => !isLoadoutLogItem(item)));
+  }
+
   function applyEnabled(nextTools: Set<string>, nextSkills: Set<string>) {
     enabledTools = normalizeEnabledTools(nextTools);
     enabledSkills = normalizeEnabledSkills(nextSkills);
@@ -301,11 +309,19 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     updateStatus(ctx);
   });
 
+  pi.on("session_before_compact", async (event) => {
+    filterLoadoutLogItemsInPlace(event.preparation.messagesToSummarize);
+    filterLoadoutLogItemsInPlace(event.preparation.turnPrefixMessages);
+    filterLoadoutLogItemsInPlace(event.branchEntries);
+  });
+
+  pi.on("session_before_tree", async (event) => {
+    filterLoadoutLogItemsInPlace(event.preparation.entriesToSummarize);
+  });
+
   pi.on("context", async (event) => {
     return {
-      messages: event.messages.filter((message) => {
-        return (message as { customType?: string }).customType !== LOG_CUSTOM_TYPE;
-      }),
+      messages: event.messages.filter((message) => !isLoadoutLogItem(message)),
     };
   });
 
