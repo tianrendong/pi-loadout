@@ -1,3 +1,6 @@
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, Skill, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import {
@@ -11,7 +14,8 @@ import {
 } from "@earendil-works/pi-tui";
 
 const STATE_CUSTOM_TYPE = "pi-loadout:selection";
-const LOG_CUSTOM_TYPE = "pi-loadout:change-log";
+const LOG_CUSTOM_TYPE = "pi-loadout:loadout changed";
+const GLOBAL_LOADOUT_PATH = join(homedir(), ".pi", "agent", "loadout.json");
 
 type StoredState = {
   enabledTools: string[];
@@ -177,6 +181,40 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return [...new Set(names)].sort((a, b) => a.localeCompare(b));
   }
 
+  function parseStoredState(value: unknown): StoredState | undefined {
+    if (!value || typeof value !== "object") return undefined;
+    const data = value as Partial<StoredState>;
+    if (!Array.isArray(data.enabledTools)) return undefined;
+
+    const enabledTools = data.enabledTools.filter((name): name is string => typeof name === "string");
+    const enabledSkills = Array.isArray(data.enabledSkills)
+      ? data.enabledSkills.filter((name): name is string => typeof name === "string")
+      : undefined;
+
+    return { enabledTools, enabledSkills };
+  }
+
+  function toStoredState(nextTools: Set<string>, nextSkills: Set<string>): StoredState {
+    return {
+      enabledTools: sorted(nextTools),
+      enabledSkills: sorted(nextSkills),
+    };
+  }
+
+  function readGlobalLoadout(): StoredState | undefined {
+    try {
+      return parseStoredState(JSON.parse(readFileSync(GLOBAL_LOADOUT_PATH, "utf8")));
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOENT") return undefined;
+      return undefined;
+    }
+  }
+
+  function writeGlobalLoadout(state: StoredState) {
+    mkdirSync(join(homedir(), ".pi", "agent"), { recursive: true });
+    writeFileSync(GLOBAL_LOADOUT_PATH, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  }
+
   function setDifference(next: Set<string>, previous: Set<string>): string[] {
     return sorted([...next].filter((name) => !previous.has(name)));
   }
@@ -194,28 +232,6 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return diff.toolsAdded.length + diff.toolsRemoved.length + diff.skillsAdded.length + diff.skillsRemoved.length > 0;
   }
 
-  function formatDiffList(prefix: "+" | "-", names: string[]): string[] {
-    return names.map((name) => `  ${prefix} ${name}`);
-  }
-
-  function formatLoadoutDiff(diff: LoadoutDiff): string {
-    if (!hasDiff(diff)) return "Loadout unchanged.";
-
-    const lines = ["Loadout diff:"];
-    const toolsChanged = diff.toolsAdded.length + diff.toolsRemoved.length > 0;
-    const skillsChanged = diff.skillsAdded.length + diff.skillsRemoved.length > 0;
-
-    if (toolsChanged) {
-      lines.push("", "Tools:", ...formatDiffList("+", diff.toolsAdded), ...formatDiffList("-", diff.toolsRemoved));
-    }
-
-    if (skillsChanged) {
-      lines.push("", "Skills:", ...formatDiffList("+", diff.skillsAdded), ...formatDiffList("-", diff.skillsRemoved));
-    }
-
-    return lines.join("\n");
-  }
-
   function formatInlineDiff(added: string[], removed: string[]): string {
     return [...added.map((name) => `+${name}`), ...removed.map((name) => `-${name}`)].join(" ");
   }
@@ -231,7 +247,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return lines.join("\n");
   }
 
-  function logAppliedLoadout(diff: LoadoutDiff) {
+  function logAppliedLoadout(diff: LoadoutDiff, commandSource: string) {
     pi.sendMessage<LoadoutLogDetails>(
       {
         customType: LOG_CUSTOM_TYPE,
@@ -242,7 +258,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           previousLoadout: "before",
           newLoadout: "after",
           diff,
-          commandSource: "/loadout",
+          commandSource,
         },
       },
       { triggerTurn: false },
@@ -257,31 +273,61 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     items.splice(0, items.length, ...items.filter((item) => !isLoadoutLogItem(item)));
   }
 
-  function applyEnabled(nextTools: Set<string>, nextSkills: Set<string>) {
+  function applyEnabledInMemory(nextTools: Set<string>, nextSkills: Set<string>) {
     enabledTools = normalizeEnabledTools(nextTools);
     enabledSkills = normalizeEnabledSkills(nextSkills);
     skillLoadoutExplicit = true;
     pi.setActiveTools([...enabledTools]);
-    pi.appendEntry<StoredState>(STATE_CUSTOM_TYPE, {
-      enabledTools: [...enabledTools],
-      enabledSkills: [...enabledSkills],
-    });
+  }
+
+  function persistEnabled() {
+    pi.appendEntry<StoredState>(STATE_CUSTOM_TYPE, toStoredState(enabledTools, enabledSkills));
+  }
+
+  function commitLoadout(
+    previousTools: Set<string>,
+    previousSkills: Set<string>,
+    nextTools: Set<string>,
+    nextSkills: Set<string>,
+    ctx: ExtensionContext,
+    commandSource: string,
+  ): LoadoutDiff {
+    const targetTools = normalizeEnabledTools(nextTools);
+    const targetSkills = normalizeEnabledSkills(nextSkills);
+    const diff = computeDiff(previousTools, targetTools, previousSkills, targetSkills);
+
+    applyEnabledInMemory(targetTools, targetSkills);
+    updateStatus(ctx);
+
+    if (!hasDiff(diff)) return diff;
+
+    persistEnabled();
+    logAppliedLoadout(diff, commandSource);
+    return diff;
+  }
+
+  function saveGlobalLoadout(nextTools: Set<string>, nextSkills: Set<string>, ctx: ExtensionContext) {
+    const targetTools = normalizeEnabledTools(nextTools);
+    const targetSkills = normalizeEnabledSkills(nextSkills);
+    writeGlobalLoadout(toStoredState(targetTools, targetSkills));
+    ctx.ui.notify(
+      `Saved default loadout: ${targetTools.size}/${allToolNames().length} tools, ${targetSkills.size}/${allSkillNames().length} skills enabled. Future sessions will use it.`,
+      "info",
+    );
   }
 
   function restoreFromBranch(ctx: ExtensionContext) {
-    let restoredTools: string[] | undefined;
-    let restoredSkills: string[] | undefined;
+    let restored: StoredState | undefined;
 
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== STATE_CUSTOM_TYPE) continue;
-      const data = entry.data as StoredState | undefined;
-      if (Array.isArray(data?.enabledTools)) restoredTools = data.enabledTools;
-      if (Array.isArray(data?.enabledSkills)) restoredSkills = data.enabledSkills;
+      restored = parseStoredState(entry.data);
     }
 
-    enabledTools = restoredTools ? normalizeEnabledTools(restoredTools) : new Set(allToolNames());
-    skillLoadoutExplicit = !!restoredSkills;
-    enabledSkills = restoredSkills ? normalizeEnabledSkills(restoredSkills) : new Set(allSkillNames());
+    const state = restored ?? readGlobalLoadout();
+    enabledTools = state ? normalizeEnabledTools(state.enabledTools) : new Set(allToolNames());
+    skillLoadoutExplicit = !!state?.enabledSkills;
+    enabledSkills = state?.enabledSkills ? normalizeEnabledSkills(state.enabledSkills) : new Set(allSkillNames());
     pi.setActiveTools([...enabledTools]);
   }
 
@@ -465,7 +511,10 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         return pane === "tools" ? buildToolItems() : buildSkillItems();
       }
 
-      const result = await ctx.ui.custom<LoadoutResult | null>((tui, theme, _keybindings, done) => {
+      const initialEnabledTools = normalizeEnabledTools(activeToolNames());
+      const initialEnabledSkills = normalizeEnabledSkills(activeSkillNames());
+
+      const result = await ctx.ui.custom<LoadoutResult | undefined>((tui, theme, _keybindings, done) => {
         let settingsList: SettingsList;
         let selectedIndex = paneSelectedIndex[pane];
         const items = buildItems();
@@ -477,7 +526,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           const toolsLabel = pane === "tools" ? theme.fg("accent", theme.bold("[Tools]")) : theme.fg("dim", "Tools");
           const skillsLabel = pane === "skills" ? theme.fg("accent", theme.bold("[Skills]")) : theme.fg("dim", "Skills");
           headerText.setText(`${toolsLabel}  ${skillsLabel}`);
-          hintText.setText(theme.fg("dim", "Tab switch • Space toggle • Enter collapse/expand • Ctrl+S save • ↑↓/J/K navigate • Esc cancel"));
+          hintText.setText(theme.fg("dim", "Tab switch • Space toggle/apply • Enter collapse/expand • Ctrl+S save default • ↑↓/J/K navigate • Esc close"));
           cacheNoteText.setText(
             theme.fg(
               "warning",
@@ -623,9 +672,19 @@ export default function loadoutExtension(pi: ExtensionAPI) {
               draftEnabledSkills.delete(row.skill.name);
             }
 
+            applyEnabledInMemory(draftEnabledTools, draftEnabledSkills);
+            updateStatus(ctx);
             refreshValues();
+            if (hasDiff(computeDiff(initialEnabledTools, draftEnabledTools, initialEnabledSkills, draftEnabledSkills))) {
+              cacheNoteText.setText(
+                theme.fg(
+                  "warning",
+                  "Applied. Local session save happens when selector closes; next response may miss prompt cache.",
+                ),
+              );
+            }
           },
-          () => done(null),
+          () => done({ enabledTools: new Set(draftEnabledTools), enabledSkills: new Set(draftEnabledSkills) }),
         );
 
         updateHeader();
@@ -642,7 +701,14 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           invalidate: () => container.invalidate(),
           handleInput(data: string) {
             if (matchesKey(data, Key.ctrl("s"))) {
-              done({ enabledTools: new Set(draftEnabledTools), enabledSkills: new Set(draftEnabledSkills) });
+              try {
+                applyEnabledInMemory(draftEnabledTools, draftEnabledSkills);
+                updateStatus(ctx);
+                saveGlobalLoadout(draftEnabledTools, draftEnabledSkills, ctx);
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                ctx.ui.notify(`Failed to save default loadout: ${message}`, "error");
+              }
               return;
             }
 
@@ -669,26 +735,13 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         };
       });
 
-      if (result === null || result === undefined) {
-        ctx.ui.notify("Loadout unchanged.", "info");
-        return;
-      }
-
-      const currentTools = normalizeEnabledTools(activeToolNames());
-      const currentSkills = normalizeEnabledSkills(activeSkillNames());
-      const targetTools = normalizeEnabledTools(result.enabledTools);
-      const targetSkills = normalizeEnabledSkills(result.enabledSkills);
-      const diff = computeDiff(currentTools, targetTools, currentSkills, targetSkills);
-
-      ctx.ui.notify(formatLoadoutDiff(diff), "info");
-      if (!hasDiff(diff)) return;
-
-      applyEnabled(targetTools, targetSkills);
-      updateStatus(ctx);
-      logAppliedLoadout(diff);
-      ctx.ui.notify(
-        `Saved loadout: ${enabledTools.size}/${allToolNames().length} tools, ${activeSkillNames().length}/${allSkillNames().length} skills enabled.`,
-        "info",
+      commitLoadout(
+        initialEnabledTools,
+        initialEnabledSkills,
+        result?.enabledTools ?? draftEnabledTools,
+        result?.enabledSkills ?? draftEnabledSkills,
+        ctx,
+        "/loadout",
       );
     },
   });
