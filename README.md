@@ -16,6 +16,7 @@ pi install npm:pi-loadout
 
 ```text
 /loadout
+/loadout --yes
 ```
 
 Controls:
@@ -28,6 +29,8 @@ Controls:
 - `J` / `K` — navigate down / up
 - `Esc` — cancel without saving
 
+Use `--yes` or `-y` to skip prompt-cache confirmation after reviewing the diff.
+
 ## Behavior
 
 - Group rows show `● enabled` when all items in that group are enabled.
@@ -36,5 +39,8 @@ Controls:
 - Toggling a group enables/disables all tools or skills from that extension/package.
 - Toggling a tool or skill affects only that item.
 - Collapsing a group hides its item rows without changing enabled state.
+- Saving shows a concise diff before applying changes.
+- Tool/skill changes warn that the next LLM call may miss prompt cache because tool definitions or available skills changed.
+- Applied changes are logged as visible session messages for resume/export reproducibility.
 - Tool loadouts call Pi's active-tool API immediately after save.
 - Skill loadouts filter the skills shown to the model in future turns; explicit `/skill:name` commands remain available.

@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 const STATE_CUSTOM_TYPE = "pi-loadout:selection";
+const LOG_CUSTOM_TYPE = "pi-loadout:change-log";
 
 type StoredState = {
   enabledTools: string[];
@@ -48,6 +49,22 @@ type RowRef =
 type LoadoutResult = {
   enabledTools: Set<string>;
   enabledSkills: Set<string>;
+};
+
+type LoadoutDiff = {
+  toolsAdded: string[];
+  toolsRemoved: string[];
+  skillsAdded: string[];
+  skillsRemoved: string[];
+};
+
+type LoadoutLogDetails = {
+  timestamp: string;
+  previousLoadout: string;
+  newLoadout: string;
+  diff: LoadoutDiff;
+  commandSource: string;
+  cacheWarning: "acknowledged" | "--yes" | "not-applicable";
 };
 
 export default function loadoutExtension(pi: ExtensionAPI) {
@@ -157,6 +174,110 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return new Set([...names].filter((name) => available.has(name)));
   }
 
+  function sorted(names: Iterable<string>): string[] {
+    return [...new Set(names)].sort((a, b) => a.localeCompare(b));
+  }
+
+  function setDifference(next: Set<string>, previous: Set<string>): string[] {
+    return sorted([...next].filter((name) => !previous.has(name)));
+  }
+
+  function computeDiff(currentTools: Set<string>, targetTools: Set<string>, currentSkills: Set<string>, targetSkills: Set<string>): LoadoutDiff {
+    return {
+      toolsAdded: setDifference(targetTools, currentTools),
+      toolsRemoved: setDifference(currentTools, targetTools),
+      skillsAdded: setDifference(targetSkills, currentSkills),
+      skillsRemoved: setDifference(currentSkills, targetSkills),
+    };
+  }
+
+  function hasDiff(diff: LoadoutDiff): boolean {
+    return diff.toolsAdded.length + diff.toolsRemoved.length + diff.skillsAdded.length + diff.skillsRemoved.length > 0;
+  }
+
+  function hasPromptImpact(diff: LoadoutDiff): boolean {
+    return hasDiff(diff);
+  }
+
+  function formatDiffList(prefix: "+" | "-", names: string[]): string[] {
+    if (names.length === 0) return [`  ${prefix} none`];
+    return names.map((name) => `  ${prefix} ${name}`);
+  }
+
+  function formatLoadoutDiff(diff: LoadoutDiff): string {
+    if (!hasDiff(diff)) return "Loadout unchanged.";
+    return [
+      "Loadout diff: current → selected",
+      "",
+      "Tools:",
+      ...formatDiffList("+", diff.toolsAdded),
+      ...formatDiffList("-", diff.toolsRemoved),
+      "",
+      "Skills:",
+      ...formatDiffList("+", diff.skillsAdded),
+      ...formatDiffList("-", diff.skillsRemoved),
+    ].join("\n");
+  }
+
+  function formatInlineDiff(added: string[], removed: string[]): string {
+    const parts = [...added.map((name) => `+${name}`), ...removed.map((name) => `-${name}`)];
+    return parts.length > 0 ? parts.join(" ") : "no changes";
+  }
+
+  function formatCacheImpact(diff: LoadoutDiff): string {
+    const toolsChanged = diff.toolsAdded.length + diff.toolsRemoved.length > 0;
+    const skillsChanged = diff.skillsAdded.length + diff.skillsRemoved.length > 0;
+    if (toolsChanged && skillsChanged) return "Tool definitions changed and available skills changed.";
+    if (toolsChanged) return "Tool definitions changed.";
+    if (skillsChanged) return "Available skills changed.";
+    return "No prompt-cache impact.";
+  }
+
+  function formatCacheWarning(diff: LoadoutDiff): string {
+    return [
+      formatCacheImpact(diff),
+      "Changing tools/skills changes the system prompt and/or tool definitions.",
+      "Next LLM call may miss prompt cache and write a new cache entry.",
+      "Continue? [y/N]",
+    ].join("\n");
+  }
+
+  function formatLoadoutLog(diff: LoadoutDiff, timestamp: string): string {
+    const cacheLine = hasPromptImpact(diff)
+      ? "Cache: prompt cache may miss next request due to changed tool/skill prompt."
+      : "Cache: no prompt-cache impact.";
+    return [
+      `Loadout changed: current → selected (${timestamp})`,
+      `Tools: ${formatInlineDiff(diff.toolsAdded, diff.toolsRemoved)}`,
+      `Skills: ${formatInlineDiff(diff.skillsAdded, diff.skillsRemoved)}`,
+      cacheLine,
+    ].join("\n");
+  }
+
+  function parseYesFlag(args: string): boolean {
+    return args.split(/\s+/).filter(Boolean).some((arg) => arg === "--yes" || arg === "-y");
+  }
+
+  function logAppliedLoadout(diff: LoadoutDiff, cacheWarning: LoadoutLogDetails["cacheWarning"]) {
+    const timestamp = new Date().toISOString();
+    pi.sendMessage(
+      {
+        customType: LOG_CUSTOM_TYPE,
+        content: formatLoadoutLog(diff, timestamp),
+        display: true,
+        details: {
+          timestamp,
+          previousLoadout: "current",
+          newLoadout: "selected",
+          diff,
+          commandSource: "/loadout",
+          cacheWarning,
+        },
+      },
+      { triggerTurn: false },
+    );
+  }
+
   function applyEnabled(nextTools: Set<string>, nextSkills: Set<string>) {
     enabledTools = normalizeEnabledTools(nextTools);
     enabledSkills = normalizeEnabledSkills(nextSkills);
@@ -225,7 +346,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("loadout", {
     description: "Select active tools and skills for this session",
-    handler: async (_args, ctx) => {
+    handler: async (args, ctx) => {
+      const assumeYes = parseYesFlag(args);
       const tools = allTools();
       const skills = allSkills();
       if (tools.length === 0 && skills.length === 0) {
@@ -545,13 +667,42 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         };
       });
 
-      if (result === null) {
+      if (result === null || result === undefined) {
         ctx.ui.notify("Loadout unchanged.", "info");
         return;
       }
 
-      applyEnabled(result.enabledTools, result.enabledSkills);
+      const currentTools = normalizeEnabledTools(activeToolNames());
+      const currentSkills = normalizeEnabledSkills(activeSkillNames());
+      const targetTools = normalizeEnabledTools(result.enabledTools);
+      const targetSkills = normalizeEnabledSkills(result.enabledSkills);
+      const diff = computeDiff(currentTools, targetTools, currentSkills, targetSkills);
+
+      ctx.ui.notify(formatLoadoutDiff(diff), "info");
+      if (!hasDiff(diff)) return;
+
+      let cacheWarning: LoadoutLogDetails["cacheWarning"] = "not-applicable";
+      if (hasPromptImpact(diff)) {
+        if (assumeYes) {
+          cacheWarning = "--yes";
+          ctx.ui.notify(formatCacheWarning(diff), "warning");
+        } else {
+          if (!ctx.hasUI) {
+            ctx.ui.notify("Loadout change requires --yes in non-interactive mode.", "warning");
+            return;
+          }
+          const confirmed = await ctx.ui.confirm("Loadout prompt-cache impact", formatCacheWarning(diff));
+          if (!confirmed) {
+            ctx.ui.notify("Loadout unchanged.", "info");
+            return;
+          }
+          cacheWarning = "acknowledged";
+        }
+      }
+
+      applyEnabled(targetTools, targetSkills);
       updateStatus(ctx);
+      logAppliedLoadout(diff, cacheWarning);
       ctx.ui.notify(
         `Saved loadout: ${enabledTools.size}/${allToolNames().length} tools, ${activeSkillNames().length}/${allSkillNames().length} skills enabled.`,
         "info",
