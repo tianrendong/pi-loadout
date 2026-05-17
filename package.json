@@ -1,7 +1,7 @@
 {
   "name": "pi-loadout",
-  "version": "0.0.14",
-  "description": "Interactive tool loadouts for Pi sessions.",
+  "version": "0.0.15",
+  "description": "Interactive tool and skill loadouts for Pi sessions.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -17,6 +17,7 @@
     "pi",
     "pi-extension",
     "tools",
+    "skills",
     "loadout"
   ],
   "files": [
