@@ -64,7 +64,6 @@ type LoadoutLogDetails = {
   newLoadout: string;
   diff: LoadoutDiff;
   commandSource: string;
-  cacheWarning: "acknowledged" | "--yes" | "not-applicable";
 };
 
 export default function loadoutExtension(pi: ExtensionAPI) {
@@ -195,10 +194,6 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return diff.toolsAdded.length + diff.toolsRemoved.length + diff.skillsAdded.length + diff.skillsRemoved.length > 0;
   }
 
-  function hasPromptImpact(diff: LoadoutDiff): boolean {
-    return hasDiff(diff);
-  }
-
   function formatDiffList(prefix: "+" | "-", names: string[]): string[] {
     return names.map((name) => `  ${prefix} ${name}`);
   }
@@ -221,28 +216,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return lines.join("\n");
   }
 
-  function formatCacheImpact(diff: LoadoutDiff): string {
-    const toolsChanged = diff.toolsAdded.length + diff.toolsRemoved.length > 0;
-    const skillsChanged = diff.skillsAdded.length + diff.skillsRemoved.length > 0;
-    if (toolsChanged && skillsChanged) return "Tool definitions changed and available skills changed.";
-    if (toolsChanged) return "Tool definitions changed.";
-    if (skillsChanged) return "Available skills changed.";
-    return "No prompt-cache impact.";
-  }
-
-  function formatCacheWarning(diff: LoadoutDiff): string {
-    return [
-      formatCacheImpact(diff),
-      "Changing tools/skills changes the system prompt and/or tool definitions.",
-      "Next LLM call may miss prompt cache and write a new cache entry.",
-    ].join("\n");
-  }
-
-  function parseYesFlag(args: string): boolean {
-    return args.split(/\s+/).filter(Boolean).some((arg) => arg === "--yes" || arg === "-y");
-  }
-
-  function logAppliedLoadout(diff: LoadoutDiff, cacheWarning: LoadoutLogDetails["cacheWarning"]) {
+  function logAppliedLoadout(diff: LoadoutDiff) {
     // State-only audit entry. Not sent to LLM, not rendered in chat.
     // System prompt + tool schema regenerated each turn already reflect active loadout.
     pi.appendEntry<LoadoutLogDetails>(LOG_CUSTOM_TYPE, {
@@ -251,7 +225,6 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       newLoadout: "after",
       diff,
       commandSource: "/loadout",
-      cacheWarning,
     });
   }
 
@@ -323,8 +296,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("loadout", {
     description: "Select active tools and skills for this session",
-    handler: async (args, ctx) => {
-      const assumeYes = parseYesFlag(args);
+    handler: async (_args, ctx) => {
       const tools = allTools();
       const skills = allSkills();
       if (tools.length === 0 && skills.length === 0) {
@@ -454,12 +426,19 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         const items = buildItems();
         const headerText = new Text("", 1, 0);
         const hintText = new Text("", 1, 0);
+        const cacheNoteText = new Text("", 1, 0);
 
         function updateHeader() {
           const toolsLabel = pane === "tools" ? theme.fg("accent", theme.bold("[Tools]")) : theme.fg("dim", "Tools");
           const skillsLabel = pane === "skills" ? theme.fg("accent", theme.bold("[Skills]")) : theme.fg("dim", "Skills");
           headerText.setText(`${toolsLabel}  ${skillsLabel}`);
           hintText.setText(theme.fg("dim", "Tab switch • Space toggle • Enter collapse/expand group • Ctrl+S save • ↑↓/J/K navigate • Esc cancel"));
+          cacheNoteText.setText(
+            theme.fg(
+              "warning",
+              "Note: Changing loadout will make next response slower and cost more due to prompt cache miss.",
+            ),
+          );
         }
 
         function setSettingsSelectedIndex() {
@@ -609,6 +588,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
         container.addChild(headerText);
         container.addChild(hintText);
+        container.addChild(cacheNoteText);
         container.addChild(settingsList);
         container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
 
@@ -658,28 +638,9 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       ctx.ui.notify(formatLoadoutDiff(diff), "info");
       if (!hasDiff(diff)) return;
 
-      let cacheWarning: LoadoutLogDetails["cacheWarning"] = "not-applicable";
-      if (hasPromptImpact(diff)) {
-        if (assumeYes) {
-          cacheWarning = "--yes";
-          ctx.ui.notify(formatCacheWarning(diff), "warning");
-        } else {
-          if (!ctx.hasUI) {
-            ctx.ui.notify("Loadout change requires --yes in non-interactive mode.", "warning");
-            return;
-          }
-          const confirmed = await ctx.ui.confirm("Loadout prompt-cache impact", formatCacheWarning(diff));
-          if (!confirmed) {
-            ctx.ui.notify("Loadout unchanged.", "info");
-            return;
-          }
-          cacheWarning = "acknowledged";
-        }
-      }
-
       applyEnabled(targetTools, targetSkills);
       updateStatus(ctx);
-      logAppliedLoadout(diff, cacheWarning);
+      logAppliedLoadout(diff);
       ctx.ui.notify(
         `Saved loadout: ${enabledTools.size}/${allToolNames().length} tools, ${activeSkillNames().length}/${allSkillNames().length} skills enabled.`,
         "info",
