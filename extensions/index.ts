@@ -132,30 +132,40 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         return "partial";
       }
 
+      const collapsedGroups = new Set<string>();
+      let visibleRowIds: RowId[] = [];
+
       function groupDescription(group: ToolGroup): string {
         const count = group.tools.filter((tool) => draftEnabled.has(tool.name)).length;
-        return `${count}/${group.tools.length} enabled · Space/Enter toggles all tools from ${group.label}`;
+        const collapsed = collapsedGroups.has(group.key) ? "collapsed" : "expanded";
+        return `${count}/${group.tools.length} enabled · ${collapsed} · Space toggles all · Enter expands/collapses ${group.label}`;
       }
 
       function buildItems(): SettingItem[] {
         const items: SettingItem[] = [];
+        visibleRowIds = [];
         rowRefs.clear();
 
         for (const group of groups) {
           const groupId = `group:${group.key}` as RowId;
+          const collapsed = collapsedGroups.has(group.key);
           rowRefs.set(groupId, { kind: "group", group });
+          visibleRowIds.push(groupId);
           items.push({
             id: groupId,
-            label: `◆ ${group.label}`,
+            label: `${collapsed ? "▸" : "▾"} ${group.label}`,
             description: groupDescription(group),
             currentValue: groupValue(group),
             values: ["enabled", "disabled"],
           });
 
+          if (collapsed) continue;
+
           group.tools.forEach((tool, index) => {
             const toolId = `tool:${tool.name}` as RowId;
             const branch = index === group.tools.length - 1 ? "╰─" : "├─";
             rowRefs.set(toolId, { kind: "tool", group, tool });
+            visibleRowIds.push(toolId);
             items.push({
               id: toolId,
               label: `  ${branch} ${tool.name}`,
@@ -171,7 +181,30 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
       const result = await ctx.ui.custom<Set<string> | null>((tui, theme, _keybindings, done) => {
         let settingsList: SettingsList;
+        let selectedIndex = 0;
         const items = buildItems();
+
+        function setSettingsSelectedIndex() {
+          selectedIndex = Math.max(0, Math.min(selectedIndex, items.length - 1));
+          (settingsList as unknown as { selectedIndex: number }).selectedIndex = selectedIndex;
+        }
+
+        function syncSelectedIndex() {
+          selectedIndex = (settingsList as unknown as { selectedIndex: number }).selectedIndex;
+        }
+
+        function rebuildItems(preferredId?: RowId) {
+          const nextItems = buildItems();
+          items.splice(0, items.length, ...nextItems);
+
+          if (preferredId) {
+            const preferredIndex = visibleRowIds.indexOf(preferredId);
+            if (preferredIndex !== -1) selectedIndex = preferredIndex;
+          }
+
+          setSettingsSelectedIndex();
+          tui.requestRender();
+        }
 
         function refreshValues() {
           for (const group of groups) {
@@ -190,11 +223,22 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           tui.requestRender();
         }
 
+        function toggleSelectedGroupCollapse() {
+          const selectedId = visibleRowIds[selectedIndex];
+          const row = rowRefs.get(selectedId);
+          if (!row) return;
+
+          const groupId = `group:${row.group.key}` as RowId;
+          if (collapsedGroups.has(row.group.key)) collapsedGroups.delete(row.group.key);
+          else collapsedGroups.add(row.group.key);
+          rebuildItems(groupId);
+        }
+
         const listTheme: SettingsListTheme = {
           cursor: theme.fg("accent", "→ "),
           label: (text: string, selected: boolean) => {
             const trimmed = text.trimStart();
-            if (trimmed.startsWith("◆")) {
+            if (trimmed.startsWith("▸") || trimmed.startsWith("▾")) {
               const styled = theme.bold(text);
               return selected ? theme.fg("accent", styled) : theme.fg("borderAccent", styled);
             }
@@ -211,7 +255,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             return selected ? theme.fg("accent", text) : theme.fg("muted", text);
           },
           description: (text: string) => theme.fg("dim", text),
-          hint: (text: string) => theme.fg("dim", text),
+          hint: (text: string) =>
+            theme.fg("dim", text.replace("Enter/Space to change", "Space to change · Enter collapse/expand group")),
         };
 
         settingsList = new SettingsList(
@@ -242,7 +287,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
         container.addChild(new Text(theme.fg("accent", theme.bold("Tool Loadout")), 1, 0));
         container.addChild(
-          new Text(theme.fg("dim", "Space/Enter toggle • Ctrl+S save • ↑↓/J/K navigate • Esc cancel"), 1, 0),
+          new Text(theme.fg("dim", "Space toggle • Enter collapse/expand group • Ctrl+S save • ↑↓/J/K navigate • Esc cancel"), 1, 0),
         );
         container.addChild(settingsList);
         container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
@@ -256,6 +301,11 @@ export default function loadoutExtension(pi: ExtensionAPI) {
               return;
             }
 
+            if (matchesKey(data, Key.enter)) {
+              toggleSelectedGroupCollapse();
+              return;
+            }
+
             if (data === "j" || data === "J") {
               settingsList.handleInput("\x1b[B");
             } else if (data === "k" || data === "K") {
@@ -263,6 +313,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             } else {
               settingsList.handleInput(data);
             }
+            syncSelectedIndex();
             tui.requestRender();
           },
         };
