@@ -216,16 +216,37 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return lines.join("\n");
   }
 
+  function formatInlineDiff(added: string[], removed: string[]): string {
+    return [...added.map((name) => `+${name}`), ...removed.map((name) => `-${name}`)].join(" ");
+  }
+
+  function formatLoadoutLog(diff: LoadoutDiff): string {
+    const lines: string[] = [];
+    if (diff.toolsAdded.length + diff.toolsRemoved.length > 0) {
+      lines.push(`Tools: ${formatInlineDiff(diff.toolsAdded, diff.toolsRemoved)}`);
+    }
+    if (diff.skillsAdded.length + diff.skillsRemoved.length > 0) {
+      lines.push(`Skills: ${formatInlineDiff(diff.skillsAdded, diff.skillsRemoved)}`);
+    }
+    return lines.join("\n");
+  }
+
   function logAppliedLoadout(diff: LoadoutDiff) {
-    // State-only audit entry. Not sent to LLM, not rendered in chat.
-    // System prompt + tool schema regenerated each turn already reflect active loadout.
-    pi.appendEntry<LoadoutLogDetails>(LOG_CUSTOM_TYPE, {
-      timestamp: new Date().toISOString(),
-      previousLoadout: "before",
-      newLoadout: "after",
-      diff,
-      commandSource: "/loadout",
-    });
+    pi.sendMessage<LoadoutLogDetails>(
+      {
+        customType: LOG_CUSTOM_TYPE,
+        content: formatLoadoutLog(diff),
+        display: true,
+        details: {
+          timestamp: new Date().toISOString(),
+          previousLoadout: "before",
+          newLoadout: "after",
+          diff,
+          commandSource: "/loadout",
+        },
+      },
+      { triggerTurn: false },
+    );
   }
 
   function applyEnabled(nextTools: Set<string>, nextSkills: Set<string>) {
@@ -278,6 +299,14 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   pi.on("session_tree", async (_event, ctx) => {
     restoreFromBranch(ctx);
     updateStatus(ctx);
+  });
+
+  pi.on("context", async (event) => {
+    return {
+      messages: event.messages.filter((message) => {
+        return (message as { customType?: string }).customType !== LOG_CUSTOM_TYPE;
+      }),
+    };
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -432,7 +461,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           const toolsLabel = pane === "tools" ? theme.fg("accent", theme.bold("[Tools]")) : theme.fg("dim", "Tools");
           const skillsLabel = pane === "skills" ? theme.fg("accent", theme.bold("[Skills]")) : theme.fg("dim", "Skills");
           headerText.setText(`${toolsLabel}  ${skillsLabel}`);
-          hintText.setText(theme.fg("dim", "Tab switch • Space toggle • Enter collapse/expand group • Ctrl+S save • ↑↓/J/K navigate • Esc cancel"));
+          hintText.setText(theme.fg("dim", "Tab switch • Space toggle • Enter collapse/expand • Ctrl+S save • ↑↓/J/K navigate • Esc cancel"));
           cacheNoteText.setText(
             theme.fg(
               "warning",
@@ -548,7 +577,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           },
           description: (text: string) => theme.fg("dim", text),
           hint: (text: string) =>
-            theme.fg("dim", text.replace("Enter/Space to change", "Space to change · Enter collapse/expand group")),
+            theme.fg("dim", text.replace("Enter/Space to change", "Space to change · Enter collapse/expand")),
         };
 
         settingsList = new SettingsList(
