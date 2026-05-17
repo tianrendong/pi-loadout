@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext, Skill, ToolInfo } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Skill, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import {
   Container,
@@ -200,28 +200,29 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   }
 
   function formatDiffList(prefix: "+" | "-", names: string[]): string[] {
-    if (names.length === 0) return [`  ${prefix} none`];
     return names.map((name) => `  ${prefix} ${name}`);
   }
 
   function formatLoadoutDiff(diff: LoadoutDiff): string {
     if (!hasDiff(diff)) return "Loadout unchanged.";
-    return [
-      "Loadout diff: current → selected",
-      "",
-      "Tools:",
-      ...formatDiffList("+", diff.toolsAdded),
-      ...formatDiffList("-", diff.toolsRemoved),
-      "",
-      "Skills:",
-      ...formatDiffList("+", diff.skillsAdded),
-      ...formatDiffList("-", diff.skillsRemoved),
-    ].join("\n");
+
+    const lines = ["Loadout diff:"];
+    const toolsChanged = diff.toolsAdded.length + diff.toolsRemoved.length > 0;
+    const skillsChanged = diff.skillsAdded.length + diff.skillsRemoved.length > 0;
+
+    if (toolsChanged) {
+      lines.push("", "Tools:", ...formatDiffList("+", diff.toolsAdded), ...formatDiffList("-", diff.toolsRemoved));
+    }
+
+    if (skillsChanged) {
+      lines.push("", "Skills:", ...formatDiffList("+", diff.skillsAdded), ...formatDiffList("-", diff.skillsRemoved));
+    }
+
+    return lines.join("\n");
   }
 
   function formatInlineDiff(added: string[], removed: string[]): string {
-    const parts = [...added.map((name) => `+${name}`), ...removed.map((name) => `-${name}`)];
-    return parts.length > 0 ? parts.join(" ") : "no changes";
+    return [...added.map((name) => `+${name}`), ...removed.map((name) => `-${name}`)].join(" ");
   }
 
   function formatCacheImpact(diff: LoadoutDiff): string {
@@ -243,15 +244,19 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   }
 
   function formatLoadoutLog(diff: LoadoutDiff, timestamp: string): string {
-    const cacheLine = hasPromptImpact(diff)
-      ? "Cache: prompt cache may miss next request due to changed tool/skill prompt."
-      : "Cache: no prompt-cache impact.";
-    return [
-      `Loadout changed: current → selected (${timestamp})`,
-      `Tools: ${formatInlineDiff(diff.toolsAdded, diff.toolsRemoved)}`,
-      `Skills: ${formatInlineDiff(diff.skillsAdded, diff.skillsRemoved)}`,
-      cacheLine,
-    ].join("\n");
+    const lines = [`Loadout changed (${timestamp})`];
+    if (diff.toolsAdded.length + diff.toolsRemoved.length > 0) {
+      lines.push(`Tools: ${formatInlineDiff(diff.toolsAdded, diff.toolsRemoved)}`);
+    }
+    if (diff.skillsAdded.length + diff.skillsRemoved.length > 0) {
+      lines.push(`Skills: ${formatInlineDiff(diff.skillsAdded, diff.skillsRemoved)}`);
+    }
+    lines.push(
+      hasPromptImpact(diff)
+        ? "Cache: prompt cache may miss next request due to changed tool/skill prompt."
+        : "Cache: no prompt-cache impact.",
+    );
+    return lines.join("\n");
   }
 
   function parseYesFlag(args: string): boolean {
@@ -267,14 +272,46 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         display: true,
         details: {
           timestamp,
-          previousLoadout: "current",
-          newLoadout: "selected",
+          previousLoadout: "before",
+          newLoadout: "after",
           diff,
           commandSource: "/loadout",
           cacheWarning,
         },
       },
       { triggerTurn: false },
+    );
+  }
+
+  async function confirmCacheWarning(ctx: ExtensionCommandContext, diff: LoadoutDiff): Promise<boolean> {
+    const messageLines = formatCacheWarning(diff).split("\n");
+    return ctx.ui.custom<boolean>(
+      (_tui, theme, _keybindings, done) => ({
+        render: () => [
+          theme.fg("warning", theme.bold("Loadout prompt-cache impact")),
+          "",
+          ...messageLines,
+          "",
+          theme.fg("dim", "Y accept · N/Esc cancel"),
+        ],
+        handleInput(data: string) {
+          if (data === "y" || data === "Y") {
+            done(true);
+            return;
+          }
+          if (
+            data === "n" ||
+            data === "N" ||
+            matchesKey(data, Key.escape) ||
+            matchesKey(data, Key.enter) ||
+            matchesKey(data, Key.ctrl("c"))
+          ) {
+            done(false);
+          }
+        },
+        invalidate() {},
+      }),
+      { overlay: true, overlayOptions: { anchor: "center", width: 72 } },
     );
   }
 
@@ -691,7 +728,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             ctx.ui.notify("Loadout change requires --yes in non-interactive mode.", "warning");
             return;
           }
-          const confirmed = await ctx.ui.confirm("Loadout prompt-cache impact", formatCacheWarning(diff));
+          const confirmed = await confirmCacheWarning(ctx, diff);
           if (!confirmed) {
             ctx.ui.notify("Loadout unchanged.", "info");
             return;
