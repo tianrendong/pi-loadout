@@ -221,10 +221,6 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return lines.join("\n");
   }
 
-  function formatInlineDiff(added: string[], removed: string[]): string {
-    return [...added.map((name) => `+${name}`), ...removed.map((name) => `-${name}`)].join(" ");
-  }
-
   function formatCacheImpact(diff: LoadoutDiff): string {
     const toolsChanged = diff.toolsAdded.length + diff.toolsRemoved.length > 0;
     const skillsChanged = diff.skillsAdded.length + diff.skillsRemoved.length > 0;
@@ -242,39 +238,21 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     ].join("\n");
   }
 
-  function formatLoadoutLog(diff: LoadoutDiff, _timestamp: string): string {
-    const lines: string[] = [];
-    if (diff.toolsAdded.length + diff.toolsRemoved.length > 0) {
-      lines.push(`Tools: ${formatInlineDiff(diff.toolsAdded, diff.toolsRemoved)}`);
-    }
-    if (diff.skillsAdded.length + diff.skillsRemoved.length > 0) {
-      lines.push(`Skills: ${formatInlineDiff(diff.skillsAdded, diff.skillsRemoved)}`);
-    }
-    return lines.join("\n");
-  }
-
   function parseYesFlag(args: string): boolean {
     return args.split(/\s+/).filter(Boolean).some((arg) => arg === "--yes" || arg === "-y");
   }
 
   function logAppliedLoadout(diff: LoadoutDiff, cacheWarning: LoadoutLogDetails["cacheWarning"]) {
-    const timestamp = new Date().toISOString();
-    pi.sendMessage(
-      {
-        customType: LOG_CUSTOM_TYPE,
-        content: formatLoadoutLog(diff, timestamp),
-        display: true,
-        details: {
-          timestamp,
-          previousLoadout: "before",
-          newLoadout: "after",
-          diff,
-          commandSource: "/loadout",
-          cacheWarning,
-        },
-      },
-      { triggerTurn: false },
-    );
+    // State-only audit entry. Not sent to LLM, not rendered in chat.
+    // System prompt + tool schema regenerated each turn already reflect active loadout.
+    pi.appendEntry<LoadoutLogDetails>(LOG_CUSTOM_TYPE, {
+      timestamp: new Date().toISOString(),
+      previousLoadout: "before",
+      newLoadout: "after",
+      diff,
+      commandSource: "/loadout",
+      cacheWarning,
+    });
   }
 
   function applyEnabled(nextTools: Set<string>, nextSkills: Set<string>) {
