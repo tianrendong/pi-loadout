@@ -1,6 +1,6 @@
 {
   "name": "pi-loadout",
-  "version": "0.0.17",
+  "version": "0.0.18",
   "description": "Interactive tool and skill loadouts for Pi sessions.",
   "type": "module",
   "license": "MIT",

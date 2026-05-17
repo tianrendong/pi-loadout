@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Skill, ToolInfo } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Skill, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import {
   Container,
@@ -239,23 +239,17 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       formatCacheImpact(diff),
       "Changing tools/skills changes the system prompt and/or tool definitions.",
       "Next LLM call may miss prompt cache and write a new cache entry.",
-      "Continue? [y/N]",
     ].join("\n");
   }
 
-  function formatLoadoutLog(diff: LoadoutDiff, timestamp: string): string {
-    const lines = [`Loadout changed (${timestamp})`];
+  function formatLoadoutLog(diff: LoadoutDiff, _timestamp: string): string {
+    const lines: string[] = [];
     if (diff.toolsAdded.length + diff.toolsRemoved.length > 0) {
       lines.push(`Tools: ${formatInlineDiff(diff.toolsAdded, diff.toolsRemoved)}`);
     }
     if (diff.skillsAdded.length + diff.skillsRemoved.length > 0) {
       lines.push(`Skills: ${formatInlineDiff(diff.skillsAdded, diff.skillsRemoved)}`);
     }
-    lines.push(
-      hasPromptImpact(diff)
-        ? "Cache: prompt cache may miss next request due to changed tool/skill prompt."
-        : "Cache: no prompt-cache impact.",
-    );
     return lines.join("\n");
   }
 
@@ -280,38 +274,6 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         },
       },
       { triggerTurn: false },
-    );
-  }
-
-  async function confirmCacheWarning(ctx: ExtensionCommandContext, diff: LoadoutDiff): Promise<boolean> {
-    const messageLines = formatCacheWarning(diff).split("\n");
-    return ctx.ui.custom<boolean>(
-      (_tui, theme, _keybindings, done) => ({
-        render: () => [
-          theme.fg("warning", theme.bold("Loadout prompt-cache impact")),
-          "",
-          ...messageLines,
-          "",
-          theme.fg("dim", "Y accept · N/Esc cancel"),
-        ],
-        handleInput(data: string) {
-          if (data === "y" || data === "Y") {
-            done(true);
-            return;
-          }
-          if (
-            data === "n" ||
-            data === "N" ||
-            matchesKey(data, Key.escape) ||
-            matchesKey(data, Key.enter) ||
-            matchesKey(data, Key.ctrl("c"))
-          ) {
-            done(false);
-          }
-        },
-        invalidate() {},
-      }),
-      { overlay: true, overlayOptions: { anchor: "center", width: 72 } },
     );
   }
 
@@ -728,7 +690,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             ctx.ui.notify("Loadout change requires --yes in non-interactive mode.", "warning");
             return;
           }
-          const confirmed = await confirmCacheWarning(ctx, diff);
+          const confirmed = await ctx.ui.confirm("Loadout prompt-cache impact", formatCacheWarning(diff));
           if (!confirmed) {
             ctx.ui.notify("Loadout unchanged.", "info");
             return;
