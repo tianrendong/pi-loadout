@@ -385,9 +385,91 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return { systemPrompt: replaceSkillsBlock(event.systemPrompt, filteredSkills) };
   });
 
+  function formatStatus(): string {
+    const activeTools = new Set(activeToolNames());
+    const activeSkills = new Set(activeSkillNames());
+    const lines: string[] = [];
+    lines.push(
+      `Active: ${activeTools.size}/${allToolNames().length} tools · ${activeSkills.size}/${allSkillNames().length} skills`,
+    );
+
+    const toolGroups = groupTools(allTools());
+    if (toolGroups.length > 0) {
+      lines.push("", "Tools:");
+      for (const group of toolGroups) {
+        const on = group.tools.filter((t) => activeTools.has(t.name)).length;
+        lines.push(`  ${group.label} (${on}/${group.tools.length})`);
+        for (const t of group.tools) {
+          lines.push(`    ${activeTools.has(t.name) ? "●" : "○"} ${t.name}`);
+        }
+      }
+    }
+
+    const skillGroups = groupSkills(allSkills());
+    if (skillGroups.length > 0) {
+      lines.push("", "Skills:");
+      for (const group of skillGroups) {
+        const on = group.skills.filter((s) => activeSkills.has(s.name)).length;
+        lines.push(`  ${group.label} (${on}/${group.skills.length})`);
+        for (const s of group.skills) {
+          lines.push(`    ${activeSkills.has(s.name) ? "●" : "○"} ${s.name}`);
+        }
+      }
+    }
+
+    return lines.join("\n");
+  }
+
+  function loadoutHelp(): string {
+    return [
+      "/loadout commands:",
+      "  /loadout          Open interactive picker",
+      "  /loadout status   Print current active tools and skills",
+      "  /loadout reset    Re-enable every available tool and skill in this session",
+      "  /loadout help     Show this help",
+    ].join("\n");
+  }
+
   pi.registerCommand("loadout", {
     description: "Select active tools and skills for this session",
-    handler: async (_args, ctx) => {
+    handler: async (args, ctx) => {
+      const subcommand = (args ?? "").trim().split(/\s+/)[0] ?? "";
+
+      if (subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
+        ctx.ui.notify(loadoutHelp(), "info");
+        return;
+      }
+
+      if (subcommand === "status") {
+        ctx.ui.notify(formatStatus(), "info");
+        return;
+      }
+
+      if (subcommand === "reset") {
+        const previousTools = normalizeEnabledTools(activeToolNames());
+        const previousSkills = normalizeEnabledSkills(activeSkillNames());
+        const targetTools = new Set(allToolNames());
+        const targetSkills = new Set(allSkillNames());
+        const diff = commitLoadout(previousTools, previousSkills, targetTools, targetSkills, ctx, "/loadout reset");
+        if (hasDiff(diff)) {
+          ctx.ui.notify(
+            `Loadout reset: ${targetTools.size} tools, ${targetSkills.size} skills enabled. Next response may miss prompt cache.`,
+            "info",
+          );
+        } else {
+          ctx.ui.notify("Loadout already at full set. Nothing changed.", "info");
+        }
+        return;
+      }
+
+      if (subcommand !== "") {
+        ctx.ui.notify(
+          `Unknown subcommand: "${subcommand}". Try /loadout, /loadout status, /loadout reset, or /loadout help.`,
+          "warning",
+        );
+        return;
+      }
+
       const tools = allTools();
       const skills = allSkills();
       if (tools.length === 0 && skills.length === 0) {
