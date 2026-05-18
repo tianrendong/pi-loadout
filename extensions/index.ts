@@ -430,8 +430,18 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     ].join("\n");
   }
 
+  const LOADOUT_SUBCOMMANDS: { value: string; label: string; description: string }[] = [
+    { value: "status", label: "status", description: "Print current active tools and skills" },
+    { value: "reset", label: "reset", description: "Re-enable every available tool and skill" },
+    { value: "help", label: "help", description: "Show /loadout subcommand list" },
+  ];
+
   pi.registerCommand("loadout", {
     description: "Select active tools and skills for this session",
+    getArgumentCompletions: (argumentPrefix: string) => {
+      const prefix = argumentPrefix.toLowerCase();
+      return LOADOUT_SUBCOMMANDS.filter((item) => item.value.startsWith(prefix));
+    },
     handler: async (args, ctx) => {
       const subcommand = (args ?? "").trim().split(/\s+/)[0] ?? "";
 
