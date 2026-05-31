@@ -14,8 +14,11 @@ pi install npm:pi-loadout
 
 ```text
 /loadout          # open interactive picker
+/loadout full     # enable every available tool and skill
+/loadout minimal  # enable only built-in tools and skills
+/loadout default  # apply saved global default loadout
 /loadout status   # print current active tools and skills
-/loadout reset    # re-enable every available tool and skill in this session
+/loadout reset    # alias for /loadout full
 /loadout help     # show subcommand list
 ```
 
@@ -37,12 +40,14 @@ Pi enables every installed tool and skill by default. As your package list grows
 - **Disable tools you don't want the model to reach for in this session** without uninstalling the package that provides them. Saved selection persists in the current session branch and is restored when you resume.
 - **Run Pi on smaller or cheaper models** by trimming the tool definitions and skill block down to what the task actually needs.
 - **Debug extensions** by toggling individual tools or whole packages on and off without an install/reinstall cycle.
+- **Start from presets.** `/loadout full` enables everything; `/loadout minimal` enables only built-in tools and skills; `/loadout default` reapplies your saved global default.
 - **Set a sensible default once.** `Ctrl+S` in the picker writes the current selection to `~/.pi/agent/loadout.json`, which seeds new sessions until you override it per-branch.
 
 ## How it works
 
 - **Live apply.** Each toggle in the picker calls Pi's active-tool API immediately. There is no separate "save" step inside the picker for the session; changes are in effect as you make them.
 - **Branch-persisted on close.** When the picker closes (Esc, or selecting a confirmation), the current selection is appended to the session branch as a custom entry (`pi-loadout:selection`). Resuming or branching the session restores it.
+- **Presets.** `full` selects all tools and skills. `minimal` selects only entries whose source is Pi built-in. `default` applies the saved global default from `~/.pi/agent/loadout.json`.
 - **Global default (`Ctrl+S`).** Writes the current selection to `~/.pi/agent/loadout.json`. New sessions without their own branch entry read this file.
 - **Skill filtering.** The skill list shown to the model is filtered in `before_agent_start` by replacing the `<available_skills>` block. Explicit `/skill:name` invocations are unaffected.
 - **Session log entries.** Loadout changes are logged as visible session messages (`pi-loadout:loadout changed`) for resume/export readability. These log entries are filtered out of context, compaction, and tree summarization, so they don't pollute model input.
@@ -60,7 +65,7 @@ Toggling a group toggles every item in that group. Toggling an item affects only
 
 - **Prompt-cache miss on change.** Changing tool definitions or available skills invalidates provider prompt caches. The next response after a loadout change is typically slower and more expensive. If you toggle frequently within a session, expect repeated cache misses.
 - **Mid-session changes are silent to the model.** Loadout log entries are filtered out of the model's context. If a tool disappears mid-session the model may still attempt to call it on the next turn before adapting.
-- **No named profiles yet.** Only one global default and one branch override. Multiple named loadouts (e.g. `coding`, `review`) are not implemented; see the issue tracker.
+- **No custom named profiles yet.** Built-in presets exist (`full`, `minimal`), but user-defined named loadouts (e.g. `coding`, `review`) are not implemented; see the issue tracker.
 
 ## License
 

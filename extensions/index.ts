@@ -58,6 +58,7 @@ type SkillGroup = {
 };
 
 type Pane = "tools" | "skills";
+type LoadoutPresetName = "full" | "minimal";
 type RowId = `group:${string}` | `tool:${string}` | `skillgroup:${string}` | `skill:${string}`;
 
 type RowRef =
@@ -131,6 +132,10 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return [...enabledSkills].filter((name) => available.has(name));
   }
 
+  function isBuiltinSource(sourceInfo: { source?: string; path?: string } | undefined): boolean {
+    return sourceInfo?.source === "builtin" || !!sourceInfo?.path?.startsWith("<builtin:");
+  }
+
   function sourceLabel(
     sourceInfo: { source?: string; path?: string } | undefined,
     labels: { fallback: string; builtin: string; sdk: string },
@@ -142,7 +147,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
     const path = sourceInfo?.path;
     if (!path) return labels.fallback;
-    if (path.startsWith("<builtin:")) return labels.builtin;
+    if (isBuiltinSource(sourceInfo)) return labels.builtin;
     return path;
   }
 
@@ -182,6 +187,28 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     }
 
     return [...byKey.values()].sort((a, b) => a.label.localeCompare(b.label));
+  }
+
+  function presetTools(name: LoadoutPresetName): Set<string> {
+    if (name === "full") return new Set(allToolNames());
+    return new Set(allTools().filter((tool) => isBuiltinSource(tool.sourceInfo)).map((tool) => tool.name));
+  }
+
+  function presetSkills(name: LoadoutPresetName): Set<string> {
+    if (name === "full") return new Set(allSkillNames());
+    return new Set(allSkills().filter((skill) => isBuiltinSource(skill.sourceInfo)).map((skill) => skill.name));
+  }
+
+  function presetProfile(name: LoadoutPresetName): Profile {
+    return {
+      enabledTools: sorted(presetTools(name)),
+      enabledSkills: sorted(presetSkills(name)),
+      updatedAt: new Date(0).toISOString(),
+    };
+  }
+
+  function isLoadoutPresetName(name: string): name is LoadoutPresetName {
+    return name === "full" || name === "minimal";
   }
 
   function normalizeEnabledTools(names: Iterable<string>): Set<string> {
@@ -264,10 +291,14 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     };
   }
 
+  function profileForName(name: string): Profile | undefined {
+    if (isLoadoutPresetName(name)) return presetProfile(name);
+    return readProfilesFile().profiles[name];
+  }
+
   function isCurrentDirty(): boolean {
     if (!currentProfileName) return false;
-    const file = readProfilesFile();
-    const profile = file.profiles[currentProfileName];
+    const profile = profileForName(currentProfileName);
     if (!profile) return false;
     const tools = sorted(enabledTools).join("\u0001");
     const skills = sorted(enabledSkills).join("\u0001");
@@ -395,22 +426,62 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   function saveGlobalLoadout(nextTools: Set<string>, nextSkills: Set<string>, ctx: ExtensionContext) {
     const targetTools = normalizeEnabledTools(nextTools);
     const targetSkills = normalizeEnabledSkills(nextSkills);
-    writeGlobalLoadout(toStoredState(targetTools, targetSkills));
+    writeGlobalLoadout(toStoredState(targetTools, targetSkills, currentProfileName));
     ctx.ui.notify(
       `Saved default loadout: ${targetTools.size}/${allToolNames().length} tools, ${targetSkills.size}/${allSkillNames().length} skills enabled. Future sessions will use it.`,
       "info",
     );
   }
 
-  function restoreFromBranch(ctx: ExtensionContext) {
-    let restored: StoredState | undefined;
+  function applyPreset(name: LoadoutPresetName, ctx: ExtensionContext, commandSource: string): LoadoutDiff {
+    const previousTools = normalizeEnabledTools(activeToolNames());
+    const previousSkills = normalizeEnabledSkills(activeSkillNames());
+    const targetTools = presetTools(name);
+    const targetSkills = presetSkills(name);
+    const diff = commitLoadout(previousTools, previousSkills, targetTools, targetSkills, ctx, commandSource, name);
+    const label = name === "full" ? "Full" : "Minimal";
+    const suffix = hasDiff(diff) ? " Next response may miss prompt cache." : " Nothing changed.";
+    ctx.ui.notify(
+      `${label} preset applied: ${targetTools.size}/${allToolNames().length} tools, ${targetSkills.size}/${allSkillNames().length} skills enabled.${suffix}`,
+      "info",
+    );
+    return diff;
+  }
 
+  function readBranchLoadout(ctx: ExtensionContext): StoredState | undefined {
+    let restored: StoredState | undefined;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== STATE_CUSTOM_TYPE) continue;
       restored = parseStoredState(entry.data);
     }
+    return restored;
+  }
 
-    const state = restored ?? readGlobalLoadout();
+  function applyDefaultLoadout(ctx: ExtensionContext, commandSource: string): LoadoutDiff | undefined {
+    const state = readGlobalLoadout();
+    if (!state) {
+      ctx.ui.notify(
+        `No saved default loadout found. Checked ${GLOBAL_LOADOUT_PATH}. Use Ctrl+S in /loadout to save one.`,
+        "warning",
+      );
+      return undefined;
+    }
+
+    const previousTools = normalizeEnabledTools(activeToolNames());
+    const previousSkills = normalizeEnabledSkills(activeSkillNames());
+    const targetTools = normalizeEnabledTools(state.enabledTools);
+    const targetSkills = state.enabledSkills ? normalizeEnabledSkills(state.enabledSkills) : new Set(allSkillNames());
+    const diff = commitLoadout(previousTools, previousSkills, targetTools, targetSkills, ctx, commandSource, state.profileName ?? null);
+    const suffix = hasDiff(diff) ? " Next response may miss prompt cache." : " Nothing changed.";
+    ctx.ui.notify(
+      `Default loadout applied: ${targetTools.size}/${allToolNames().length} tools, ${targetSkills.size}/${allSkillNames().length} skills enabled.${suffix}`,
+      "info",
+    );
+    return diff;
+  }
+
+  function restoreFromBranch(ctx: ExtensionContext) {
+    const state = readBranchLoadout(ctx) ?? readGlobalLoadout();
     enabledTools = state ? normalizeEnabledTools(state.enabledTools) : new Set(allToolNames());
     skillLoadoutExplicit = !!state?.enabledSkills;
     enabledSkills = state?.enabledSkills ? normalizeEnabledSkills(state.enabledSkills) : new Set(allSkillNames());
@@ -516,15 +587,25 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return [
       "/loadout commands:",
       "  /loadout          Open interactive picker",
+      "  /loadout full     Enable every available tool and skill",
+      "  /loadout minimal  Enable only built-in tools and skills",
+      "  /loadout default  Apply saved global default loadout",
       "  /loadout status   Print current active tools and skills",
-      "  /loadout reset    Re-enable every available tool and skill in this session",
+      "  /loadout reset    Alias for /loadout full",
       "  /loadout help     Show this help",
     ].join("\n");
   }
 
   const LOADOUT_SUBCOMMANDS: { value: string; label: string; description: string }[] = [
+    { value: "full", label: "full", description: "Enable every available tool and skill" },
+    { value: "minimal", label: "minimal", description: "Enable only built-in tools and skills" },
+    { value: "default", label: "default", description: "Apply saved global default loadout" },
+    { value: "preset", label: "preset", description: "Apply a named preset" },
+    { value: "preset full", label: "preset full", description: "Enable every available tool and skill" },
+    { value: "preset minimal", label: "preset minimal", description: "Enable only built-in tools and skills" },
+    { value: "preset default", label: "preset default", description: "Apply saved global default loadout" },
     { value: "status", label: "status", description: "Print current active tools and skills" },
-    { value: "reset", label: "reset", description: "Re-enable every available tool and skill" },
+    { value: "reset", label: "reset", description: "Alias for /loadout full" },
     { value: "help", label: "help", description: "Show /loadout subcommand list" },
   ];
 
@@ -535,7 +616,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       return LOADOUT_SUBCOMMANDS.filter((item) => item.value.startsWith(prefix));
     },
     handler: async (args, ctx) => {
-      const subcommand = (args ?? "").trim().split(/\s+/)[0] ?? "";
+      const words = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const subcommand = words[0] ?? "";
 
       if (subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
         ctx.ui.notify(loadoutHelp(), "info");
@@ -547,26 +629,38 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         return;
       }
 
-      if (subcommand === "reset") {
-        const previousTools = normalizeEnabledTools(activeToolNames());
-        const previousSkills = normalizeEnabledSkills(activeSkillNames());
-        const targetTools = new Set(allToolNames());
-        const targetSkills = new Set(allSkillNames());
-        const diff = commitLoadout(previousTools, previousSkills, targetTools, targetSkills, ctx, "/loadout reset");
-        if (hasDiff(diff)) {
-          ctx.ui.notify(
-            `Loadout reset: ${targetTools.size} tools, ${targetSkills.size} skills enabled. Next response may miss prompt cache.`,
-            "info",
-          );
-        } else {
-          ctx.ui.notify("Loadout already at full set. Nothing changed.", "info");
+      if (subcommand === "reset" || subcommand === "full") {
+        applyPreset("full", ctx, `/loadout ${subcommand}`);
+        return;
+      }
+
+      if (subcommand === "minimal") {
+        applyPreset("minimal", ctx, "/loadout minimal");
+        return;
+      }
+
+      if (subcommand === "default") {
+        applyDefaultLoadout(ctx, "/loadout default");
+        return;
+      }
+
+      if (subcommand === "preset") {
+        const presetName = words[1] ?? "";
+        if (isLoadoutPresetName(presetName)) {
+          applyPreset(presetName, ctx, `/loadout preset ${presetName}`);
+          return;
         }
+        if (presetName === "default") {
+          applyDefaultLoadout(ctx, "/loadout preset default");
+          return;
+        }
+        ctx.ui.notify('Unknown preset. Try /loadout preset full, /loadout preset minimal, or /loadout preset default.', "warning");
         return;
       }
 
       if (subcommand !== "") {
         ctx.ui.notify(
-          `Unknown subcommand: "${subcommand}". Try /loadout, /loadout status, /loadout reset, or /loadout help.`,
+          `Unknown subcommand: "${subcommand}". Try /loadout, /loadout full, /loadout minimal, /loadout default, /loadout status, or /loadout help.`,
           "warning",
         );
         return;
