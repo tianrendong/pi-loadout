@@ -57,15 +57,21 @@ type SkillGroup = {
   skills: SkillInfo[];
 };
 
-type Pane = "tools" | "skills";
+type Pane = "tools" | "skills" | "presets";
 type LoadoutPresetName = "full" | "minimal";
-type RowId = `group:${string}` | `tool:${string}` | `skillgroup:${string}` | `skill:${string}`;
+type RowId =
+  | `group:${string}`
+  | `tool:${string}`
+  | `skillgroup:${string}`
+  | `skill:${string}`
+  | `preset:${string}`;
 
 type RowRef =
   | { kind: "toolGroup"; group: ToolGroup }
   | { kind: "tool"; group: ToolGroup; tool: ToolInfo }
   | { kind: "skillGroup"; group: SkillGroup }
-  | { kind: "skill"; group: SkillGroup; skill: SkillInfo };
+  | { kind: "skill"; group: SkillGroup; skill: SkillInfo }
+  | { kind: "preset"; name: string; source: "builtin" | "default" | "user"; profile?: Profile };
 
 type LoadoutResult = {
   enabledTools: Set<string>;
@@ -211,6 +217,35 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return name === "full" || name === "minimal";
   }
 
+  function profileFromStoredState(state: StoredState): Profile {
+    return {
+      enabledTools: sorted(state.enabledTools),
+      enabledSkills: sorted(state.enabledSkills ?? allSkillNames()),
+      updatedAt: new Date(0).toISOString(),
+    };
+  }
+
+  const RESERVED_PROFILE_NAMES = new Set([
+    "default",
+    "delete",
+    "full",
+    "help",
+    "list",
+    "minimal",
+    "preset",
+    "reset",
+    "rm",
+    "save",
+    "status",
+    "use",
+  ]);
+
+  function validateProfileName(name: string): string | undefined {
+    if (!PROFILE_NAME_PATTERN.test(name)) return "Use 1-64 chars: letters, numbers, dot, underscore, dash; must start alphanumeric.";
+    if (RESERVED_PROFILE_NAMES.has(name)) return `Reserved profile name: ${name}`;
+    return undefined;
+  }
+
   function normalizeEnabledTools(names: Iterable<string>): Set<string> {
     const available = new Set(allToolNames());
     return new Set([...names].filter((name) => available.has(name)));
@@ -293,7 +328,15 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
   function profileForName(name: string): Profile | undefined {
     if (isLoadoutPresetName(name)) return presetProfile(name);
+    if (name === "default") {
+      const state = readGlobalLoadout();
+      return state ? profileFromStoredState(state) : undefined;
+    }
     return readProfilesFile().profiles[name];
+  }
+
+  function isUserProfileName(name: string | undefined): name is string {
+    return !!name && !isLoadoutPresetName(name) && name !== "default";
   }
 
   function isCurrentDirty(): boolean {
@@ -480,6 +523,93 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return diff;
   }
 
+  function applyNamedLoadout(name: string, ctx: ExtensionContext, commandSource: string): LoadoutDiff | undefined {
+    if (isLoadoutPresetName(name)) return applyPreset(name, ctx, commandSource);
+    if (name === "default") return applyDefaultLoadout(ctx, commandSource);
+
+    const profile = readProfilesFile().profiles[name];
+    if (!profile) {
+      ctx.ui.notify(`Unknown loadout preset: ${name}. Try /loadout list.`, "warning");
+      return undefined;
+    }
+
+    const previousTools = normalizeEnabledTools(activeToolNames());
+    const previousSkills = normalizeEnabledSkills(activeSkillNames());
+    const targetTools = normalizeEnabledTools(profile.enabledTools);
+    const targetSkills = normalizeEnabledSkills(profile.enabledSkills);
+    const diff = commitLoadout(previousTools, previousSkills, targetTools, targetSkills, ctx, commandSource, name);
+    const suffix = hasDiff(diff) ? " Next response may miss prompt cache." : " Nothing changed.";
+    ctx.ui.notify(
+      `Preset ${name} applied: ${targetTools.size}/${allToolNames().length} tools, ${targetSkills.size}/${allSkillNames().length} skills enabled.${suffix}`,
+      "info",
+    );
+    return diff;
+  }
+
+  function saveUserProfile(name: string, nextTools: Set<string>, nextSkills: Set<string>, ctx: ExtensionContext) {
+    const error = validateProfileName(name);
+    if (error) {
+      ctx.ui.notify(error, "warning");
+      return false;
+    }
+
+    const file = readProfilesFile();
+    file.profiles[name] = {
+      enabledTools: sorted(normalizeEnabledTools(nextTools)),
+      enabledSkills: sorted(normalizeEnabledSkills(nextSkills)),
+      updatedAt: new Date().toISOString(),
+    };
+    writeProfilesFile(file);
+    currentProfileName = name;
+    persistEnabled();
+    updateStatus(ctx);
+    ctx.ui.notify(`Saved loadout preset: ${name}`, "info");
+    return true;
+  }
+
+  function deleteUserProfile(name: string, ctx: ExtensionContext) {
+    if (RESERVED_PROFILE_NAMES.has(name) || isLoadoutPresetName(name) || name === "default") {
+      ctx.ui.notify(`Cannot delete built-in preset: ${name}`, "warning");
+      return false;
+    }
+
+    const file = readProfilesFile();
+    if (!file.profiles[name]) {
+      ctx.ui.notify(`Unknown loadout preset: ${name}`, "warning");
+      return false;
+    }
+
+    delete file.profiles[name];
+    if (file.defaultProfile === name) delete file.defaultProfile;
+    writeProfilesFile(file);
+    if (currentProfileName === name) currentProfileName = undefined;
+    persistEnabled();
+    updateStatus(ctx);
+    ctx.ui.notify(`Deleted loadout preset: ${name}`, "info");
+    return true;
+  }
+
+  function formatProfileList(): string {
+    const lines = ["Loadout presets:"];
+    lines.push(`  full      built-in · ${allToolNames().length}/${allToolNames().length} tools · ${allSkillNames().length}/${allSkillNames().length} skills`);
+    lines.push(`  minimal   built-in · ${presetTools("minimal").size}/${allToolNames().length} tools · ${presetSkills("minimal").size}/${allSkillNames().length} skills`);
+    const defaultState = readGlobalLoadout();
+    lines.push(
+      defaultState
+        ? `  default   global · ${normalizeEnabledTools(defaultState.enabledTools).size}/${allToolNames().length} tools · ${normalizeEnabledSkills(defaultState.enabledSkills ?? allSkillNames()).size}/${allSkillNames().length} skills`
+        : "  default   global · not saved",
+    );
+
+    const profiles = readProfilesFile().profiles;
+    for (const name of Object.keys(profiles).sort()) {
+      const profile = profiles[name];
+      lines.push(
+        `  ${name}${currentProfileName === name ? " *" : ""}  user · ${normalizeEnabledTools(profile.enabledTools).size}/${allToolNames().length} tools · ${normalizeEnabledSkills(profile.enabledSkills).size}/${allSkillNames().length} skills · updated ${formatRelativeTime(profile.updatedAt)}`,
+      );
+    }
+    return lines.join("\n");
+  }
+
   function restoreFromBranch(ctx: ExtensionContext) {
     const state = readBranchLoadout(ctx) ?? readGlobalLoadout();
     enabledTools = state ? normalizeEnabledTools(state.enabledTools) : new Set(allToolNames());
@@ -590,6 +720,10 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       "  /loadout full     Enable every available tool and skill",
       "  /loadout minimal  Enable only built-in tools and skills",
       "  /loadout default  Apply saved global default loadout",
+      "  /loadout save <name>    Save current loadout as user preset",
+      "  /loadout use <name>     Apply built-in, default, or user preset",
+      "  /loadout list           List built-in and user presets",
+      "  /loadout delete <name>  Delete user preset",
       "  /loadout status   Print current active tools and skills",
       "  /loadout reset    Alias for /loadout full",
       "  /loadout help     Show this help",
@@ -600,6 +734,11 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     { value: "full", label: "full", description: "Enable every available tool and skill" },
     { value: "minimal", label: "minimal", description: "Enable only built-in tools and skills" },
     { value: "default", label: "default", description: "Apply saved global default loadout" },
+    { value: "save", label: "save", description: "Save current loadout as user preset" },
+    { value: "use", label: "use", description: "Apply built-in, default, or user preset" },
+    { value: "list", label: "list", description: "List built-in and user presets" },
+    { value: "delete", label: "delete", description: "Delete user preset" },
+    { value: "rm", label: "rm", description: "Delete user preset" },
     { value: "preset", label: "preset", description: "Apply a named preset" },
     { value: "preset full", label: "preset full", description: "Enable every available tool and skill" },
     { value: "preset minimal", label: "preset minimal", description: "Enable only built-in tools and skills" },
@@ -613,7 +752,12 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     description: "Select active tools and skills for this session",
     getArgumentCompletions: (argumentPrefix: string) => {
       const prefix = argumentPrefix.toLowerCase();
-      return LOADOUT_SUBCOMMANDS.filter((item) => item.value.startsWith(prefix));
+      const profileItems = Object.keys(readProfilesFile().profiles).flatMap((name) => [
+        { value: `use ${name}`, label: `use ${name}`, description: "Apply user preset" },
+        { value: `preset ${name}`, label: `preset ${name}`, description: "Apply user preset" },
+        { value: `delete ${name}`, label: `delete ${name}`, description: "Delete user preset" },
+      ]);
+      return [...LOADOUT_SUBCOMMANDS, ...profileItems].filter((item) => item.value.toLowerCase().startsWith(prefix));
     },
     handler: async (args, ctx) => {
       const words = (args ?? "").trim().split(/\s+/).filter(Boolean);
@@ -644,23 +788,54 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (subcommand === "list") {
+        ctx.ui.notify(formatProfileList(), "info");
+        return;
+      }
+
+      if (subcommand === "save") {
+        const name = words[1] ?? (isUserProfileName(currentProfileName) ? currentProfileName : "");
+        if (!name) {
+          ctx.ui.notify("Usage: /loadout save <name>", "warning");
+          return;
+        }
+        saveUserProfile(name, normalizeEnabledTools(activeToolNames()), normalizeEnabledSkills(activeSkillNames()), ctx);
+        return;
+      }
+
+      if (subcommand === "use") {
+        const name = words[1] ?? "";
+        if (!name) {
+          ctx.ui.notify("Usage: /loadout use <name>", "warning");
+          return;
+        }
+        applyNamedLoadout(name, ctx, `/loadout use ${name}`);
+        return;
+      }
+
+      if (subcommand === "delete" || subcommand === "rm") {
+        const name = words[1] ?? "";
+        if (!name) {
+          ctx.ui.notify(`Usage: /loadout ${subcommand} <name>`, "warning");
+          return;
+        }
+        deleteUserProfile(name, ctx);
+        return;
+      }
+
       if (subcommand === "preset") {
         const presetName = words[1] ?? "";
-        if (isLoadoutPresetName(presetName)) {
-          applyPreset(presetName, ctx, `/loadout preset ${presetName}`);
+        if (presetName) {
+          applyNamedLoadout(presetName, ctx, `/loadout preset ${presetName}`);
           return;
         }
-        if (presetName === "default") {
-          applyDefaultLoadout(ctx, "/loadout preset default");
-          return;
-        }
-        ctx.ui.notify('Unknown preset. Try /loadout preset full, /loadout preset minimal, or /loadout preset default.', "warning");
+        ctx.ui.notify("Usage: /loadout preset <name>", "warning");
         return;
       }
 
       if (subcommand !== "") {
         ctx.ui.notify(
-          `Unknown subcommand: "${subcommand}". Try /loadout, /loadout full, /loadout minimal, /loadout default, /loadout status, or /loadout help.`,
+          `Unknown subcommand: "${subcommand}". Try /loadout, /loadout list, /loadout save <name>, /loadout use <name>, or /loadout help.`,
           "warning",
         );
         return;
@@ -702,7 +877,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         return fuzzyMatch(searchQuery, text).matches;
       }
       let visibleRowIds: RowId[] = [];
-      const paneSelectedIndex: Record<Pane, number> = { tools: 0, skills: 0 };
+      const paneSelectedIndex: Record<Pane, number> = { tools: 0, skills: 0, presets: 0 };
 
       function toolGroupDescription(group: ToolGroup): string {
         const count = group.tools.filter((tool) => draftEnabledTools.has(tool.name)).length;
@@ -800,10 +975,49 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         return items;
       }
 
+      function buildPresetItems(): SettingItem[] {
+        const items: SettingItem[] = [];
+        const query = searchQuery.trim();
+        const defaultState = readGlobalLoadout();
+        const presets: Array<{ name: string; source: "builtin" | "default" | "user"; profile?: Profile }> = [
+          { name: "full", source: "builtin", profile: presetProfile("full") },
+          { name: "minimal", source: "builtin", profile: presetProfile("minimal") },
+          { name: "default", source: "default", profile: defaultState ? profileFromStoredState(defaultState) : undefined },
+          ...Object.entries(readProfilesFile().profiles).map(([name, profile]) => ({ name, source: "user" as const, profile })),
+        ];
+
+        for (const preset of presets) {
+          if (query !== "" && !matchesQuery(preset.name) && !matchesQuery(preset.source)) continue;
+          const presetId = `preset:${preset.name}` as RowId;
+          const toolsCount = preset.profile ? normalizeEnabledTools(preset.profile.enabledTools).size : 0;
+          const skillsCount = preset.profile ? normalizeEnabledSkills(preset.profile.enabledSkills).size : 0;
+          rowRefs.set(presetId, { kind: "preset", ...preset });
+          visibleRowIds.push(presetId);
+          items.push({
+            id: presetId,
+            label: preset.name,
+            description:
+              preset.source === "user"
+                ? `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · updated ${formatRelativeTime(preset.profile?.updatedAt ?? "")}`
+                : preset.source === "default"
+                  ? preset.profile
+                    ? `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · saved global default`
+                    : `No global default saved at ${GLOBAL_LOADOUT_PATH}`
+                  : `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · built-in`,
+            currentValue: currentProfileName === preset.name ? (isCurrentDirty() ? "active*" : "active") : preset.source,
+            values: ["apply"],
+          });
+        }
+
+        return items;
+      }
+
       function buildItems(): SettingItem[] {
         visibleRowIds = [];
         rowRefs.clear();
-        return pane === "tools" ? buildToolItems() : buildSkillItems();
+        if (pane === "tools") return buildToolItems();
+        if (pane === "skills") return buildSkillItems();
+        return buildPresetItems();
       }
 
       const initialEnabledTools = normalizeEnabledTools(activeToolNames());
@@ -823,9 +1037,10 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         function updateHeader() {
           const toolsLabel = pane === "tools" ? theme.fg("accent", theme.bold("[Tools]")) : theme.fg("dim", "Tools");
           const skillsLabel = pane === "skills" ? theme.fg("accent", theme.bold("[Skills]")) : theme.fg("dim", "Skills");
-          headerText.setText(`${toolsLabel}  ${skillsLabel}`);
-          searchLabel.setText(theme.fg("dim", "Search (filter by tool, skill, or extension name):"));
-          hintText.setText(theme.fg("dim", "Type to search • Tab switch Tools/Skills • Space toggle/apply • Enter collapse/expand • ↑↓ navigate • Ctrl+S save default • Esc clear/close"));
+          const presetsLabel = pane === "presets" ? theme.fg("accent", theme.bold("[Presets]")) : theme.fg("dim", "Presets");
+          headerText.setText(`${toolsLabel}  ${skillsLabel}  ${presetsLabel}`);
+          searchLabel.setText(theme.fg("dim", pane === "presets" ? "Search presets, or type name then Ctrl+P to save:" : "Search (filter by tool, skill, or extension name):"));
+          hintText.setText(theme.fg("dim", "Type to search • Tab switch Tools/Skills/Presets • Space apply/toggle • Enter apply/collapse • Ctrl+P save preset • Ctrl+D delete preset • Ctrl+S save default • ↑↓ navigate • Esc clear/close"));
           cacheNoteText.setText(
             theme.fg(
               "warning",
@@ -875,7 +1090,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
                 );
               }
             }
-          } else {
+          } else if (pane === "skills") {
             for (const group of skillGroups) {
               const groupId = `skillgroup:${group.key}`;
               settingsList.updateValue(groupId, skillGroupValue(group));
@@ -906,15 +1121,41 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             return;
           }
 
-          const groupId = `skillgroup:${row.group.key}` as RowId;
-          if (collapsedSkillGroups.has(row.group.key)) collapsedSkillGroups.delete(row.group.key);
-          else collapsedSkillGroups.add(row.group.key);
-          rebuildItems(groupId);
+          if (row.kind === "skillGroup" || row.kind === "skill") {
+            const groupId = `skillgroup:${row.group.key}` as RowId;
+            if (collapsedSkillGroups.has(row.group.key)) collapsedSkillGroups.delete(row.group.key);
+            else collapsedSkillGroups.add(row.group.key);
+            rebuildItems(groupId);
+            return;
+          }
+
+          applyPresetRow(row);
+        }
+
+        function applyPresetRow(row: Extract<RowRef, { kind: "preset" }>) {
+          if (!row.profile) {
+            ctx.ui.notify(`No saved ${row.name} loadout found.`, "warning");
+            return;
+          }
+
+          draftEnabledTools.clear();
+          for (const name of normalizeEnabledTools(row.profile.enabledTools)) draftEnabledTools.add(name);
+          draftEnabledSkills.clear();
+          for (const name of normalizeEnabledSkills(row.profile.enabledSkills)) draftEnabledSkills.add(name);
+          applyEnabledInMemory(draftEnabledTools, draftEnabledSkills);
+          if (row.source === "default") {
+            currentProfileName = readGlobalLoadout()?.profileName;
+          } else {
+            currentProfileName = row.name;
+          }
+          updateStatus(ctx);
+          cacheNoteText.setText(theme.fg("warning", "Applied preset. Local session save happens when selector closes; next response may miss prompt cache."));
+          rebuildItems(`preset:${row.name}` as RowId);
         }
 
         function switchPane() {
           syncSelectedIndex();
-          pane = pane === "tools" ? "skills" : "tools";
+          pane = pane === "tools" ? "skills" : pane === "skills" ? "presets" : "tools";
           selectedIndex = paneSelectedIndex[pane];
           rebuildItems();
         }
@@ -957,6 +1198,11 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           (id, newValue) => {
             const row = rowRefs.get(id as RowId);
             if (!row) return;
+
+            if (row.kind === "preset") {
+              applyPresetRow(row);
+              return;
+            }
 
             if (row.kind === "toolGroup") {
               for (const tool of row.group.tools) {
@@ -1007,6 +1253,30 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           render: (width: number) => container.render(width),
           invalidate: () => container.invalidate(),
           handleInput(data: string) {
+            if (matchesKey(data, Key.ctrl("p"))) {
+              const name = searchInput.getValue().trim() || (isUserProfileName(currentProfileName) ? currentProfileName : "");
+              if (!name) {
+                ctx.ui.notify("Type a preset name in the search field, then press Ctrl+P to save.", "warning");
+                return;
+              }
+              if (saveUserProfile(name, draftEnabledTools, draftEnabledSkills, ctx) && pane === "presets") {
+                rebuildItems(`preset:${name}` as RowId);
+              }
+              return;
+            }
+
+            if (pane === "presets" && matchesKey(data, Key.ctrl("d"))) {
+              const selectedId = visibleRowIds[selectedIndex];
+              const row = rowRefs.get(selectedId);
+              if (!row || row.kind !== "preset") return;
+              if (row.source !== "user") {
+                ctx.ui.notify(`Cannot delete built-in preset: ${row.name}`, "warning");
+                return;
+              }
+              if (deleteUserProfile(row.name, ctx)) rebuildItems();
+              return;
+            }
+
             if (matchesKey(data, Key.ctrl("s"))) {
               try {
                 applyEnabledInMemory(draftEnabledTools, draftEnabledSkills);
