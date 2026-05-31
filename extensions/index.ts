@@ -731,7 +731,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           const skillsLabel = pane === "skills" ? theme.fg("accent", theme.bold("[Skills]")) : theme.fg("dim", "Skills");
           headerText.setText(`${toolsLabel}  ${skillsLabel}`);
           searchLabel.setText(theme.fg("dim", "Search (filter by tool, skill, or extension name):"));
-          hintText.setText(theme.fg("dim", "Type to search • Tab switch • Space toggle/apply • Enter collapse/expand • ↑↓ navigate • Ctrl+S save default • Esc clear/close"));
+          hintText.setText(theme.fg("dim", "Type to search • Tab switch Tools/Skills • Space toggle/apply • Enter collapse/expand • ↑↓ navigate • Ctrl+S save default • Esc clear/close"));
           cacheNoteText.setText(
             theme.fg(
               "warning",
