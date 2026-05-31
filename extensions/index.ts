@@ -5,6 +5,8 @@ import type { ExtensionAPI, ExtensionContext, Skill, ToolInfo } from "@earendil-
 import { DynamicBorder, formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import {
   Container,
+  fuzzyMatch,
+  Input,
   Key,
   matchesKey,
   SettingsList,
@@ -16,10 +18,24 @@ import {
 const STATE_CUSTOM_TYPE = "pi-loadout:selection";
 const LOG_CUSTOM_TYPE = "pi-loadout:loadout changed";
 const GLOBAL_LOADOUT_PATH = join(homedir(), ".pi", "agent", "loadout.json");
+const PROFILES_PATH = join(homedir(), ".pi", "agent", "loadout-profiles.json");
+const PROFILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 type StoredState = {
   enabledTools: string[];
   enabledSkills?: string[];
+  profileName?: string;
+};
+
+type Profile = {
+  enabledTools: string[];
+  enabledSkills: string[];
+  updatedAt: string;
+};
+
+type ProfilesFile = {
+  defaultProfile?: string;
+  profiles: Record<string, Profile>;
 };
 
 type ToolGroup = {
@@ -74,6 +90,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   let enabledTools = new Set<string>();
   let enabledSkills = new Set<string>();
   let skillLoadoutExplicit = false;
+  let currentProfileName: string | undefined;
 
   function allTools(): ToolInfo[] {
     const byName = new Map<string, ToolInfo>();
@@ -190,15 +207,81 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     const enabledSkills = Array.isArray(data.enabledSkills)
       ? data.enabledSkills.filter((name): name is string => typeof name === "string")
       : undefined;
+    const profileName = typeof data.profileName === "string" ? data.profileName : undefined;
 
-    return { enabledTools, enabledSkills };
+    return { enabledTools, enabledSkills, profileName };
   }
 
-  function toStoredState(nextTools: Set<string>, nextSkills: Set<string>): StoredState {
-    return {
+  function toStoredState(nextTools: Set<string>, nextSkills: Set<string>, profileName?: string): StoredState {
+    const state: StoredState = {
       enabledTools: sorted(nextTools),
       enabledSkills: sorted(nextSkills),
     };
+    if (profileName) state.profileName = profileName;
+    return state;
+  }
+
+  function readProfilesFile(): ProfilesFile {
+    try {
+      const parsed = JSON.parse(readFileSync(PROFILES_PATH, "utf8")) as Partial<ProfilesFile>;
+      const profiles: Record<string, Profile> = {};
+      if (parsed && typeof parsed === "object" && parsed.profiles && typeof parsed.profiles === "object") {
+        for (const [name, value] of Object.entries(parsed.profiles)) {
+          if (!value || typeof value !== "object") continue;
+          const v = value as Partial<Profile>;
+          if (!Array.isArray(v.enabledTools) || !Array.isArray(v.enabledSkills)) continue;
+          profiles[name] = {
+            enabledTools: v.enabledTools.filter((n): n is string => typeof n === "string"),
+            enabledSkills: v.enabledSkills.filter((n): n is string => typeof n === "string"),
+            updatedAt: typeof v.updatedAt === "string" ? v.updatedAt : new Date(0).toISOString(),
+          };
+        }
+      }
+      const defaultProfile =
+        parsed && typeof parsed === "object" && typeof parsed.defaultProfile === "string" && profiles[parsed.defaultProfile]
+          ? parsed.defaultProfile
+          : undefined;
+      return { defaultProfile, profiles };
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOENT") return { profiles: {} };
+      return { profiles: {} };
+    }
+  }
+
+  function writeProfilesFile(file: ProfilesFile) {
+    mkdirSync(join(homedir(), ".pi", "agent"), { recursive: true });
+    const ordered: ProfilesFile = { profiles: {} };
+    if (file.defaultProfile) ordered.defaultProfile = file.defaultProfile;
+    for (const name of Object.keys(file.profiles).sort()) ordered.profiles[name] = file.profiles[name];
+    writeFileSync(PROFILES_PATH, `${JSON.stringify(ordered, null, 2)}\n`, "utf8");
+  }
+
+  function profileSnapshotFromCurrent(): Profile {
+    return {
+      enabledTools: sorted(enabledTools),
+      enabledSkills: sorted(enabledSkills),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  function isCurrentDirty(): boolean {
+    if (!currentProfileName) return false;
+    const file = readProfilesFile();
+    const profile = file.profiles[currentProfileName];
+    if (!profile) return false;
+    const tools = sorted(enabledTools).join("\u0001");
+    const skills = sorted(enabledSkills).join("\u0001");
+    return tools !== profile.enabledTools.join("\u0001") || skills !== profile.enabledSkills.join("\u0001");
+  }
+
+  function formatRelativeTime(iso: string): string {
+    const then = Date.parse(iso);
+    if (Number.isNaN(then)) return "unknown";
+    const diffSec = Math.max(0, Math.floor((Date.now() - then) / 1000));
+    if (diffSec < 60) return `${diffSec}s ago`;
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+    return `${Math.floor(diffSec / 86400)}d ago`;
   }
 
   function readGlobalLoadout(): StoredState | undefined {
@@ -281,7 +364,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   }
 
   function persistEnabled() {
-    pi.appendEntry<StoredState>(STATE_CUSTOM_TYPE, toStoredState(enabledTools, enabledSkills));
+    pi.appendEntry<StoredState>(STATE_CUSTOM_TYPE, toStoredState(enabledTools, enabledSkills, currentProfileName));
   }
 
   function commitLoadout(
@@ -291,18 +374,21 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     nextSkills: Set<string>,
     ctx: ExtensionContext,
     commandSource: string,
+    nextProfileName?: string | null,
   ): LoadoutDiff {
     const targetTools = normalizeEnabledTools(nextTools);
     const targetSkills = normalizeEnabledSkills(nextSkills);
     const diff = computeDiff(previousTools, targetTools, previousSkills, targetSkills);
 
     applyEnabledInMemory(targetTools, targetSkills);
+    if (nextProfileName === null) currentProfileName = undefined;
+    else if (typeof nextProfileName === "string") currentProfileName = nextProfileName;
     updateStatus(ctx);
 
-    if (!hasDiff(diff)) return diff;
+    if (!hasDiff(diff) && nextProfileName === undefined) return diff;
 
     persistEnabled();
-    logAppliedLoadout(diff, commandSource);
+    if (hasDiff(diff)) logAppliedLoadout(diff, commandSource);
     return diff;
   }
 
@@ -328,14 +414,20 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     enabledTools = state ? normalizeEnabledTools(state.enabledTools) : new Set(allToolNames());
     skillLoadoutExplicit = !!state?.enabledSkills;
     enabledSkills = state?.enabledSkills ? normalizeEnabledSkills(state.enabledSkills) : new Set(allSkillNames());
+    currentProfileName = state?.profileName;
+    if (!currentProfileName) {
+      const file = readProfilesFile();
+      if (file.defaultProfile && file.profiles[file.defaultProfile]) {
+        currentProfileName = file.defaultProfile;
+      }
+    }
     pi.setActiveTools([...enabledTools]);
   }
 
   function updateStatus(ctx: ExtensionContext) {
-    ctx.ui.setStatus(
-      "loadout",
-      `${activeToolNames().length}/${allToolNames().length} tools · ${activeSkillNames().length}/${allSkillNames().length} skills`,
-    );
+    const counts = `${activeToolNames().length}/${allToolNames().length} tools · ${activeSkillNames().length}/${allSkillNames().length} skills`;
+    const prefix = currentProfileName ? `${currentProfileName}${isCurrentDirty() ? "*" : ""} · ` : "";
+    ctx.ui.setStatus("loadout", `${prefix}${counts}`);
   }
 
   function replaceSkillsBlock(systemPrompt: string, nextSkills: Skill[]): string {
@@ -509,7 +601,12 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
       const collapsedToolGroups = new Set<string>();
       const collapsedSkillGroups = new Set<string>();
+      let searchQuery = "";
       let pane: Pane = tools.length > 0 ? "tools" : "skills";
+
+      function matchesQuery(text: string): boolean {
+        return fuzzyMatch(searchQuery, text).matches;
+      }
       let visibleRowIds: RowId[] = [];
       const paneSelectedIndex: Record<Pane, number> = { tools: 0, skills: 0 };
 
@@ -527,10 +624,16 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
       function buildToolItems(): SettingItem[] {
         const items: SettingItem[] = [];
+        const query = searchQuery.trim();
 
         for (const group of toolGroups) {
+          const groupMatch = query === "" || matchesQuery(group.label);
+          const tools =
+            query === "" || groupMatch ? group.tools : group.tools.filter((tool) => matchesQuery(tool.name));
+          if (query !== "" && !groupMatch && tools.length === 0) continue;
+
           const groupId = `group:${group.key}` as RowId;
-          const collapsed = collapsedToolGroups.has(group.key);
+          const collapsed = query === "" && collapsedToolGroups.has(group.key);
           rowRefs.set(groupId, { kind: "toolGroup", group });
           visibleRowIds.push(groupId);
           items.push({
@@ -543,9 +646,9 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
           if (collapsed) continue;
 
-          group.tools.forEach((tool, index) => {
+          tools.forEach((tool, index) => {
             const toolId = `tool:${tool.name}` as RowId;
-            const branch = index === group.tools.length - 1 ? "╰─" : "├─";
+            const branch = index === tools.length - 1 ? "╰─" : "├─";
             rowRefs.set(toolId, { kind: "tool", group, tool });
             visibleRowIds.push(toolId);
             items.push({
@@ -563,10 +666,16 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
       function buildSkillItems(): SettingItem[] {
         const items: SettingItem[] = [];
+        const query = searchQuery.trim();
 
         for (const group of skillGroups) {
+          const groupMatch = query === "" || matchesQuery(group.label);
+          const skills =
+            query === "" || groupMatch ? group.skills : group.skills.filter((skill) => matchesQuery(skill.name));
+          if (query !== "" && !groupMatch && skills.length === 0) continue;
+
           const groupId = `skillgroup:${group.key}` as RowId;
-          const collapsed = collapsedSkillGroups.has(group.key);
+          const collapsed = query === "" && collapsedSkillGroups.has(group.key);
           rowRefs.set(groupId, { kind: "skillGroup", group });
           visibleRowIds.push(groupId);
           items.push({
@@ -579,9 +688,9 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
           if (collapsed) continue;
 
-          group.skills.forEach((skill, index) => {
+          skills.forEach((skill, index) => {
             const skillId = `skill:${skill.name}` as RowId;
-            const branch = index === group.skills.length - 1 ? "╰─" : "├─";
+            const branch = index === skills.length - 1 ? "╰─" : "├─";
             rowRefs.set(skillId, { kind: "skill", group, skill });
             visibleRowIds.push(skillId);
             items.push({
@@ -611,6 +720,9 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         let selectedIndex = paneSelectedIndex[pane];
         const items = buildItems();
         const headerText = new Text("", 1, 0);
+        const searchLabel = new Text("", 1, 0);
+        const searchInput = new Input();
+        searchInput.focused = true;
         const hintText = new Text("", 1, 0);
         const cacheNoteText = new Text("", 1, 0);
 
@@ -618,7 +730,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           const toolsLabel = pane === "tools" ? theme.fg("accent", theme.bold("[Tools]")) : theme.fg("dim", "Tools");
           const skillsLabel = pane === "skills" ? theme.fg("accent", theme.bold("[Skills]")) : theme.fg("dim", "Skills");
           headerText.setText(`${toolsLabel}  ${skillsLabel}`);
-          hintText.setText(theme.fg("dim", "Tab switch • Space toggle/apply • Enter collapse/expand • Ctrl+S save default • ↑↓/J/K navigate • Esc close"));
+          searchLabel.setText(theme.fg("dim", "Search (filter by tool, skill, or extension name):"));
+          hintText.setText(theme.fg("dim", "Type to search • Tab switch • Space toggle/apply • Enter collapse/expand • ↑↓ navigate • Ctrl+S save default • Esc clear/close"));
           cacheNoteText.setText(
             theme.fg(
               "warning",
@@ -712,6 +825,12 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           rebuildItems();
         }
 
+        function applySearch() {
+          paneSelectedIndex[pane] = 0;
+          selectedIndex = 0;
+          rebuildItems();
+        }
+
         const listTheme: SettingsListTheme = {
           cursor: theme.fg("accent", "→ "),
           label: (text: string, selected: boolean) => {
@@ -783,6 +902,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         const container = new Container();
         container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
         container.addChild(headerText);
+        container.addChild(searchLabel);
+        container.addChild(searchInput);
         container.addChild(hintText);
         container.addChild(cacheNoteText);
         container.addChild(settingsList);
@@ -809,20 +930,40 @@ export default function loadoutExtension(pi: ExtensionAPI) {
               return;
             }
 
+            if (matchesKey(data, Key.escape)) {
+              if (searchQuery !== "") {
+                searchInput.setValue("");
+                searchQuery = "";
+                applySearch();
+                return;
+              }
+              done({ enabledTools: new Set(draftEnabledTools), enabledSkills: new Set(draftEnabledSkills) });
+              return;
+            }
+
+            // Navigation and toggle keys are handled by the list; everything else
+            // (printable characters, word-delete, etc.) edits the search field.
+            if (matchesKey(data, Key.up) || matchesKey(data, Key.down) || data === " ") {
+              settingsList.handleInput(data);
+              syncSelectedIndex();
+              tui.requestRender();
+              return;
+            }
+
             if (matchesKey(data, Key.enter)) {
               toggleSelectedGroupCollapse();
               return;
             }
 
-            if (data === "j" || data === "J") {
-              settingsList.handleInput("\x1b[B");
-            } else if (data === "k" || data === "K") {
-              settingsList.handleInput("\x1b[A");
+            const before = searchInput.getValue();
+            searchInput.handleInput(data);
+            const after = searchInput.getValue();
+            if (after !== before) {
+              searchQuery = after;
+              applySearch();
             } else {
-              settingsList.handleInput(data);
+              tui.requestRender();
             }
-            syncSelectedIndex();
-            tui.requestRender();
           },
         };
       });

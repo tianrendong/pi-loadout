@@ -21,12 +21,13 @@ pi install npm:pi-loadout
 
 ### Picker controls
 
+- Just start typing — filters tools/skills live by their name **or** their extension/source name (standard text editing, including word delete with Option/Alt+Delete)
 - `Tab` — switch between Tools and Skills panes
 - `Space` — toggle the selected group, tool, or skill (applies immediately)
 - `Enter` — collapse/expand the selected group
 - `Ctrl+S` — save current selection as the global default (`~/.pi/agent/loadout.json`)
-- `↑` / `↓` or `J` / `K` — navigate
-- `Esc` — close the picker (live changes are kept and persisted to the session branch)
+- `↑` / `↓` — navigate
+- `Esc` — clear the search filter if one is active, otherwise close the picker (live changes are kept and persisted to the session branch)
 
 ## Why use `/loadout`?
 
