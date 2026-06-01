@@ -28,7 +28,10 @@ pi install npm:pi-loadout
 
 ### Picker controls
 
+The hint bar is contextual to the active pane, and the selected row's description spells out the actions available on it. Press `?` for the full shortcut overlay:
+
 - Just start typing — filters tools/skills live by their name **or** their extension/source name (standard text editing, including word delete with Option/Alt+Delete)
+- `?` — toggle the shortcut overlay
 - `Tab` — switch between Tools, Skills, and Presets panes
 - `Space` — toggle the selected group/tool/skill, or apply the selected preset (applies immediately)
 - `Enter` — collapse/expand the selected group, or apply the selected preset

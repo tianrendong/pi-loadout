@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/tianrendong/pi-loadout.git"
+    "url": "git+https://github.com/tianrendong/pi-loadout.git"
   },
   "bugs": {
     "url": "https://github.com/tianrendong/pi-loadout/issues"

@@ -612,6 +612,17 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
   function restoreFromBranch(ctx: ExtensionContext) {
     const state = readBranchLoadout(ctx) ?? readGlobalLoadout();
+    // Built-in presets are dynamic: re-expand them against the currently available
+    // tools/skills instead of replaying a frozen list, so they self-heal when the
+    // installed tool/skill set changes between sessions.
+    if (state?.profileName && isLoadoutPresetName(state.profileName)) {
+      enabledTools = presetTools(state.profileName);
+      enabledSkills = presetSkills(state.profileName);
+      skillLoadoutExplicit = true;
+      currentProfileName = state.profileName;
+      pi.setActiveTools([...enabledTools]);
+      return;
+    }
     enabledTools = state ? normalizeEnabledTools(state.enabledTools) : new Set(allToolNames());
     skillLoadoutExplicit = !!state?.enabledSkills;
     enabledSkills = state?.enabledSkills ? normalizeEnabledSkills(state.enabledSkills) : new Set(allSkillNames());
@@ -882,13 +893,13 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       function toolGroupDescription(group: ToolGroup): string {
         const count = group.tools.filter((tool) => draftEnabledTools.has(tool.name)).length;
         const collapsed = collapsedToolGroups.has(group.key) ? "collapsed" : "expanded";
-        return `${count}/${group.tools.length} enabled · ${collapsed} · Space toggles all · Enter expands/collapses ${group.label}`;
+        return `${group.label} · ${count}/${group.tools.length} enabled · ${collapsed} · Space toggles group · Enter expands/collapses`;
       }
 
       function skillGroupDescription(group: SkillGroup): string {
         const count = group.skills.filter((skill) => draftEnabledSkills.has(skill.name)).length;
         const collapsed = collapsedSkillGroups.has(group.key) ? "collapsed" : "expanded";
-        return `${count}/${group.skills.length} enabled · ${collapsed} · Space toggles all · Enter expands/collapses ${group.label}`;
+        return `${group.label} · ${count}/${group.skills.length} enabled · ${collapsed} · Space toggles group · Enter expands/collapses`;
       }
 
       function buildToolItems(): SettingItem[] {
@@ -923,7 +934,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             items.push({
               id: toolId,
               label: `  ${branch} ${tool.name}`,
-              description: tool.description ? `${group.label} · ${tool.description}` : group.label,
+              description: `${tool.description ? `${group.label} · ${tool.description}` : group.label} · Space toggles tool`,
               currentValue: draftEnabledTools.has(tool.name) ? "enabled" : "disabled",
               values: ["enabled", "disabled"],
             });
@@ -965,7 +976,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             items.push({
               id: skillId,
               label: `  ${branch} ${skill.name}`,
-              description: skill.description ? `${group.label} · ${skill.description}` : group.label,
+              description: `${skill.description ? `${group.label} · ${skill.description}` : group.label} · Space toggles skill`,
               currentValue: draftEnabledSkills.has(skill.name) ? "enabled" : "disabled",
               values: ["enabled", "disabled"],
             });
@@ -998,12 +1009,12 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             label: preset.name,
             description:
               preset.source === "user"
-                ? `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · updated ${formatRelativeTime(preset.profile?.updatedAt ?? "")}`
+                ? `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · updated ${formatRelativeTime(preset.profile?.updatedAt ?? "")} · Space/Enter applies · Ctrl+D deletes`
                 : preset.source === "default"
                   ? preset.profile
-                    ? `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · saved global default`
-                    : `No global default saved at ${GLOBAL_LOADOUT_PATH}`
-                  : `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · built-in`,
+                    ? `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · saved global default · Space/Enter applies`
+                    : `No global default saved at ${GLOBAL_LOADOUT_PATH} · Ctrl+S saves one`
+                  : `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · built-in · Space/Enter applies`,
             currentValue: currentProfileName === preset.name ? (isCurrentDirty() ? "active*" : "active") : preset.source,
             values: ["apply"],
           });
@@ -1026,6 +1037,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       const result = await ctx.ui.custom<LoadoutResult | undefined>((tui, theme, _keybindings, done) => {
         let settingsList: SettingsList;
         let selectedIndex = paneSelectedIndex[pane];
+        let helpVisible = false;
         const items = buildItems();
         const headerText = new Text("", 1, 0);
         const searchLabel = new Text("", 1, 0);
@@ -1039,8 +1051,15 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           const skillsLabel = pane === "skills" ? theme.fg("accent", theme.bold("[Skills]")) : theme.fg("dim", "Skills");
           const presetsLabel = pane === "presets" ? theme.fg("accent", theme.bold("[Presets]")) : theme.fg("dim", "Presets");
           headerText.setText(`${toolsLabel}  ${skillsLabel}  ${presetsLabel}`);
-          searchLabel.setText(theme.fg("dim", pane === "presets" ? "Search presets, or type name then Ctrl+P to save:" : "Search (filter by tool, skill, or extension name):"));
-          hintText.setText(theme.fg("dim", "Type to search • Tab switch Tools/Skills/Presets • Space apply/toggle • Enter apply/collapse • Ctrl+P save preset • Ctrl+D delete preset • Ctrl+S save default • ↑↓ navigate • Esc clear/close"));
+          searchLabel.setText(theme.fg("dim", pane === "presets" ? "Filter presets, or type a name then Ctrl+P to save:" : "Search (filter by tool, skill, or extension name):"));
+          hintText.setText(
+            theme.fg(
+              "dim",
+              pane === "presets"
+                ? "Type to filter or name • Tab switch pane • Space/Enter apply • Ctrl+P save • Ctrl+D delete • ? shortcuts • Esc clear/close"
+                : "Type to search • Tab switch pane • Space toggle • Enter collapse • Ctrl+S save default • ? shortcuts • Esc clear/close",
+            ),
+          );
           cacheNoteText.setText(
             theme.fg(
               "warning",
@@ -1249,10 +1268,55 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         container.addChild(settingsList);
         container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
 
+        const helpContainer = new Container();
+        const helpTitle = new Text(theme.fg("accent", theme.bold("Loadout shortcuts")), 1, 0);
+        const helpBody = new Text(
+          [
+            theme.fg("borderAccent", "Global"),
+            `  ${theme.bold("Tab")}      Switch Tools / Skills / Presets`,
+            `  ${theme.bold("↑ ↓")}      Navigate`,
+            `  ${theme.bold("Type")}     Search / filter (Presets: also the new preset name)`,
+            `  ${theme.bold("Ctrl+S")}   Save current selection as global default`,
+            `  ${theme.bold("Esc")}      Clear search, or close picker`,
+            "",
+            theme.fg("borderAccent", "Tools / Skills"),
+            `  ${theme.bold("Space")}    Toggle selected item or group`,
+            `  ${theme.bold("Enter")}    Expand / collapse selected group`,
+            "",
+            theme.fg("borderAccent", "Presets"),
+            `  ${theme.bold("Space")}    Apply selected preset`,
+            `  ${theme.bold("Enter")}    Apply selected preset`,
+            `  ${theme.bold("Ctrl+P")}   Save current selection as the typed preset name`,
+            `  ${theme.bold("Ctrl+D")}   Delete selected user preset`,
+          ].join("\n"),
+          1,
+          0,
+        );
+        const helpHint = new Text(theme.fg("dim", "? or Esc to close"), 1, 0);
+        helpContainer.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
+        helpContainer.addChild(helpTitle);
+        helpContainer.addChild(helpBody);
+        helpContainer.addChild(helpHint);
+        helpContainer.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
+
         return {
-          render: (width: number) => container.render(width),
+          render: (width: number) => (helpVisible ? helpContainer.render(width) : container.render(width)),
           invalidate: () => container.invalidate(),
           handleInput(data: string) {
+            if (helpVisible) {
+              if (data === "?" || matchesKey(data, Key.escape)) {
+                helpVisible = false;
+                tui.requestRender();
+              }
+              return;
+            }
+
+            if (data === "?") {
+              helpVisible = true;
+              tui.requestRender();
+              return;
+            }
+
             if (matchesKey(data, Key.ctrl("p"))) {
               const name = searchInput.getValue().trim() || (isUserProfileName(currentProfileName) ? currentProfileName : "");
               if (!name) {
