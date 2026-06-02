@@ -642,11 +642,51 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     ctx.ui.setStatus("loadout", `${prefix}${counts}`);
   }
 
+  function formatCodexSkillsForPrompt(skills: Skill[]): string {
+    if (skills.length === 0) return "";
+
+    const lines = [
+      "<skills_instructions>",
+      "## Skills",
+      "A skill is a set of local instructions in a `SKILL.md` file.",
+      "### Available skills",
+    ];
+
+    for (const skill of skills) {
+      lines.push(`- ${skill.name}: ${skill.description} (file: ${skill.filePath})`);
+    }
+
+    lines.push("### How to use skills");
+    lines.push("- Use a skill when the user names it (`$SkillName` or plain text) or when the request clearly matches its description.");
+    lines.push("- Use the minimal required set of skills. If multiple apply, use them together and state the order briefly.");
+    lines.push("- For each selected skill, open its `SKILL.md`, resolve relative paths from the skill directory first, load only the files you need, and prefer existing scripts/assets/templates over recreating them.");
+    lines.push("### Fallback");
+    lines.push("- If a skill is missing or its path cannot be read, say so briefly and continue with the best fallback approach.");
+    lines.push("</skills_instructions>");
+
+    return lines.join("\n");
+  }
+
   function replaceSkillsBlock(systemPrompt: string, nextSkills: Skill[]): string {
-    const skillBlockPattern = /\n?The following skills provide specialized instructions for specific tasks\.[\s\S]*?<\/available_skills>/;
-    const nextBlock = formatSkillsForPrompt(nextSkills);
-    if (skillBlockPattern.test(systemPrompt)) return systemPrompt.replace(skillBlockPattern, nextBlock ? `\n${nextBlock}` : "");
-    return systemPrompt;
+    const availableSkillsBlockPattern = /\n?The following skills provide specialized instructions for specific tasks\.[\s\S]*?<\/available_skills>/;
+    const codexSkillsBlockPattern = /\n?<skills_instructions>\n## Skills\n[\s\S]*?<\/skills_instructions>/;
+    const hasCodexSkillsBlock = codexSkillsBlockPattern.test(systemPrompt);
+    const nextAvailableSkillsBlock = formatSkillsForPrompt(nextSkills);
+    const nextCodexSkillsBlock = formatCodexSkillsForPrompt(nextSkills);
+    let nextPrompt = systemPrompt;
+
+    if (availableSkillsBlockPattern.test(nextPrompt)) {
+      nextPrompt = nextPrompt.replace(
+        availableSkillsBlockPattern,
+        hasCodexSkillsBlock || !nextAvailableSkillsBlock ? "" : `\n${nextAvailableSkillsBlock}`,
+      );
+    }
+
+    if (codexSkillsBlockPattern.test(nextPrompt)) {
+      nextPrompt = nextPrompt.replace(codexSkillsBlockPattern, nextCodexSkillsBlock ? `\n${nextCodexSkillsBlock}` : "");
+    }
+
+    return nextPrompt;
   }
 
   pi.on("session_start", async (_event, ctx) => {
