@@ -1033,6 +1033,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
       const initialEnabledTools = normalizeEnabledTools(activeToolNames());
       const initialEnabledSkills = normalizeEnabledSkills(activeSkillNames());
+      let draftProfileName: string | undefined = currentProfileName;
+      let draftProfileNameTouched = false;
 
       const result = await ctx.ui.custom<LoadoutResult | undefined>((tui, theme, _keybindings, done) => {
         let settingsList: SettingsList;
@@ -1163,10 +1165,12 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           for (const name of normalizeEnabledSkills(row.profile.enabledSkills)) draftEnabledSkills.add(name);
           applyEnabledInMemory(draftEnabledTools, draftEnabledSkills);
           if (row.source === "default") {
-            currentProfileName = readGlobalLoadout()?.profileName;
+            draftProfileName = readGlobalLoadout()?.profileName;
           } else {
-            currentProfileName = row.name;
+            draftProfileName = row.name;
           }
+          draftProfileNameTouched = true;
+          currentProfileName = draftProfileName;
           updateStatus(ctx);
           cacheNoteText.setText(theme.fg("warning", "Applied preset. Local session save happens when selector closes; next response may miss prompt cache."));
           rebuildItems(`preset:${row.name}` as RowId);
@@ -1323,8 +1327,10 @@ export default function loadoutExtension(pi: ExtensionAPI) {
                 ctx.ui.notify("Type a preset name in the search field, then press Ctrl+P to save.", "warning");
                 return;
               }
-              if (saveUserProfile(name, draftEnabledTools, draftEnabledSkills, ctx) && pane === "presets") {
-                rebuildItems(`preset:${name}` as RowId);
+              if (saveUserProfile(name, draftEnabledTools, draftEnabledSkills, ctx)) {
+                draftProfileName = name;
+                draftProfileNameTouched = true;
+                if (pane === "presets") rebuildItems(`preset:${name}` as RowId);
               }
               return;
             }
@@ -1337,7 +1343,13 @@ export default function loadoutExtension(pi: ExtensionAPI) {
                 ctx.ui.notify(`Cannot delete built-in preset: ${row.name}`, "warning");
                 return;
               }
-              if (deleteUserProfile(row.name, ctx)) rebuildItems();
+              if (deleteUserProfile(row.name, ctx)) {
+                if (draftProfileName === row.name) {
+                  draftProfileName = undefined;
+                  draftProfileNameTouched = true;
+                }
+                rebuildItems();
+              }
               return;
             }
 
@@ -1403,6 +1415,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         result?.enabledSkills ?? draftEnabledSkills,
         ctx,
         "/loadout",
+        draftProfileNameTouched ? (draftProfileName ?? null) : undefined,
       );
     },
   });
