@@ -74,7 +74,7 @@ Toggling a group toggles every item in that group. Toggling an item affects only
 
 ## Caveats
 
-- **Prompt-cache miss on change.** Changing tool definitions or available skills invalidates provider prompt caches. The next response after a loadout change is typically slower and more expensive. If you toggle frequently within a session, expect repeated cache misses.
+- **Prompt-cache impact on change.** On Pi versions with structured system prompt sections, loadout changes are appended as mid-conversation system messages (a `skills` section patch plus `toolsAdded`/`toolsRemoved`), so the earlier cached prefix is preserved on providers that support it. On older Pi versions, or providers that cannot represent the transition, a change may still invalidate the prompt cache and make the next response slower and more expensive.
 - **Mid-session changes are silent to the model.** Loadout log entries are filtered out of the model's context. If a tool disappears mid-session the model may still attempt to call it on the next turn before adapting.
 - **Preset snapshots are explicit.** User presets store exact tool and skill names. If extensions are later removed, missing entries are ignored when applying the preset.
 
