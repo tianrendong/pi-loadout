@@ -649,6 +649,11 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return systemPrompt;
   }
 
+  function supportsStructuredSections(options: unknown): boolean {
+    const sections = (options as { sections?: unknown } | undefined)?.sections;
+    return typeof sections === "object" && sections !== null;
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     restoreFromBranch(ctx);
     updateStatus(ctx);
@@ -685,6 +690,16 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     const normalized = new Set([...enabledSkills].filter((name) => availableNames.has(name)));
     const filteredSkills = skills.filter((skill) => normalized.has(skill.name));
     if (filteredSkills.length === skills.length) return;
+
+    // Newer pi builds the prompt from structured, named sections and diffs them into
+    // mid-conversation system messages. Mutating systemPromptOptions.skills lets pi
+    // append a small `skills` section patch instead of re-sending a forced prompt,
+    // which keeps the cached prefix intact. Fall back to a full prompt override on
+    // older pi versions without structured sections.
+    if (supportsStructuredSections(event.systemPromptOptions)) {
+      event.systemPromptOptions.skills = filteredSkills;
+      return;
+    }
 
     return { systemPrompt: replaceSkillsBlock(event.systemPrompt, filteredSkills) };
   });
