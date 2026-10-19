@@ -361,6 +361,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       registered: loadout.registered,
       getExposure: (name) => (hiddenSet.has(name) ? "codemode" : loadout.getExposure(name)),
       getNamespace: (name) => loadout.getNamespace(name),
+      getPromptGuidelines: (name) => loadout.getPromptGuidelines?.(name) ?? [],
     });
     return {
       descriptions: delegated?.descriptions,
