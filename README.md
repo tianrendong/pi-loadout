@@ -14,14 +14,14 @@ pi install npm:pi-loadout
 
 ```text
 /loadout          # open interactive picker
-/loadout full     # enable every tool and skill (codemode/MCP tools stay codemode-only)
+/loadout full     # enable every tool and skill (codemode/deferred tools such as MCP keep their exposure)
 /loadout minimal  # enable only built-in tools and skills
 /loadout default  # apply saved global default loadout
 /loadout save <name>    # save current loadout as a user preset
 /loadout use <name>     # apply a built-in, default, or user preset
 /loadout list           # list built-in and user presets
 /loadout delete <name>  # delete a user preset
-/loadout mode <direct|codemode|off> <tool...>  # set how tools are reached (* wildcards ok)
+/loadout mode <direct|codemode|deferred|off> <tool...>  # set tool exposure (* wildcards ok)
 /loadout status   # print current active tools and skills
 /loadout reset    # alias for /loadout full
 /loadout help     # show subcommand list
@@ -34,7 +34,7 @@ The hint bar is contextual to the active pane, and the selected row's descriptio
 - Just start typing — filters tools/skills live by their name **or** their extension/source name (standard text editing, including word delete with Option/Alt+Delete)
 - `?` — toggle the shortcut overlay
 - `Tab` — switch between Tools, Skills, and Presets panes
-- `Space` — toggle the selected skill/group, cycle the selected tool (or tool group) through `direct` → `codemode` → `off`, or apply the selected preset (applies immediately)
+- `Space` — toggle the selected skill/group, cycle the selected tool (or tool group) through `direct` → `codemode` → `deferred` → `off`, or apply the selected preset (applies immediately)
 - `Enter` — collapse/expand the selected group, or apply the selected preset
 - `Ctrl+P` — save current selection as a user preset using the search field as the preset name
 - `Ctrl+D` — delete the selected user preset in the Presets pane
@@ -42,31 +42,33 @@ The hint bar is contextual to the active pane, and the selected row's descriptio
 - `↑` / `↓` — navigate
 - `Esc` — clear the search filter if one is active, otherwise close the picker (live changes are kept and persisted to the session branch)
 
-### Tool modes: direct vs codemode
+### Tool modes
 
-When Pi's `codemode` tool is available, each tool can be set to one of three modes:
+When Pi's `codemode` tool is available, each tool can be set to one of four modes. The three reachable ones are named after Pi's tool exposures (see "Tool exposure" in Pi's `docs/extensions.md`):
 
 - `● direct` — declared to the model as a normal tool.
-- `◆ codemode` — not declared to the model; only callable from `codemode` scripts (`tools.<name>(args)`) and listed in the `codemode` tool's description.
-- `○ off` — not reachable.
+- `◆ codemode` — not declared; callable from `codemode` scripts (`tools.<name>(args)`) and listed in the `codemode` tool's description.
+- `◇ deferred` — like `codemode`, but not listed; the model finds it with `searchTools()` / `describeTool()`. Use it for rarely used tools so the description's inline budget (`codemode.inlineBudget`, default 3000 tokens) goes to the tools you use most. Pi fills that budget cheapest-first, so tools with large schemas are the first to be silently left out. Unlike a tool registered with `deferred` exposure, `tool_search` does not load it.
+- `○ off` — not reachable, not even from `codemode` scripts or when the model is asked to call it, until you switch it back. (Not Pi's `hidden` exposure, which withdraws a tool for good.)
 
-Which modes apply depends on the tool's exposure:
+Which modes apply depends on the tool's registered exposure:
 
 | Tool exposure | Modes |
 |---|---|
-| `direct` (built-in and most extension tools) | direct, codemode, off |
-| `codemode` / `deferred` (e.g. MCP tools) | direct, codemode (always callable from scripts) |
+| `direct` (built-in and most extension tools) | direct, codemode, deferred, off |
+| `codemode` / `deferred` (e.g. MCP tools) | direct, or its own exposure (always callable from scripts) |
 | `model-only` (e.g. `codemode` itself) | direct, off |
 
 Set modes in the picker with `Space`, or from the command line:
 
 ```text
-/loadout mode codemode read grep find   # only via codemode scripts
+/loadout mode codemode read grep find   # call only from codemode scripts
+/loadout mode deferred launchdarkly_*    # call from scripts, but leave unlisted
 /loadout mode direct mcp__linear__*     # declare these MCP tools directly
-/loadout mode off write
+/loadout mode off write                 # `hidden` is accepted as an alias
 ```
 
-Setting a tool to `codemode` enables the `codemode` tool if it is off. Codemode-only `direct` tools stay active but their declarations are hidden through a `prepareLoadout` hook on an internal `pi_loadout_codemode_only` tool, the same mechanism Pi's `codemode.mode: "only"` setting uses. Tool modes are saved with the session branch, the global default, and user presets (`codemodeTools`). Tools that are not registered yet when a loadout is applied (such as MCP tools of servers still connecting) are applied once they register.
+Setting a tool to `codemode` or `deferred` enables the `codemode` tool if it is off. Those tools stay active, but their declarations are hidden through a `prepareLoadout` hook on an internal `pi_loadout_codemode_only` tool, the same mechanism Pi's `codemode.mode: "only"` setting uses, and the hook presents them to `codemode` with the matching exposure. Tool modes are saved with the session branch, the global default, and user presets (`codemodeTools`, `deferredTools`). Tools that are not registered yet when a loadout is applied (such as MCP tools of servers still connecting) are applied once they register.
 
 ## Why use `/loadout`?
 
@@ -84,7 +86,7 @@ Pi enables every installed tool and skill by default. As your package list grows
 
 - **Live apply.** Each toggle in the picker calls Pi's active-tool API immediately. There is no separate "save" step inside the picker for the session; changes are in effect as you make them.
 - **Branch-persisted on close.** When the picker closes (Esc, or selecting a confirmation), the current selection is appended to the session branch as a custom entry (`pi-loadout:selection`). Resuming or branching the session restores it.
-- **Presets.** `full` selects all tools and skills (tools with `codemode`/`deferred` exposure, such as MCP tools, stay codemode-only). `minimal` selects only entries whose source is Pi built-in. `default` applies the saved global default from `~/.pi/agent/loadout.json`. User presets are full snapshots saved under `~/.pi/agent/loadout-profiles.json`.
+- **Presets.** `full` selects all tools and skills (tools with `codemode`/`deferred` exposure, such as MCP tools, keep their exposure). `minimal` selects only entries whose source is Pi built-in. `default` applies the saved global default from `~/.pi/agent/loadout.json`. User presets are full snapshots saved under `~/.pi/agent/loadout-profiles.json`.
 - **Interactive Presets pane.** Press `Tab` to reach Presets. `Space`/`Enter` applies the selected preset. Type a name and press `Ctrl+P` to save the current selection. Select a user preset and press `Ctrl+D` to delete it.
 - **Global default (`Ctrl+S`).** Writes the current selection to `~/.pi/agent/loadout.json`. New sessions without their own branch entry read this file.
 - **Skill filtering.** The skill list shown to the model is filtered in `before_agent_start` by replacing the `<available_skills>` block. Explicit `/skill:name` invocations are unaffected.
