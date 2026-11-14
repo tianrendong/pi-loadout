@@ -36,11 +36,16 @@ const GLOBAL_LOADOUT_PATH = join(homedir(), ".pi", "agent", "loadout.json");
 const PROFILES_PATH = join(homedir(), ".pi", "agent", "loadout-profiles.json");
 const PROFILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const CODEMODE_TOOL = "codemode";
+/** MCP resource tools, which reach every server with resources. */
+const MCP_RESOURCE_TOOLS = new Set(["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]);
+const MCP_RESOURCES_GROUP_KEY = "mcp:<resources>";
 /**
  * Internal tool whose `prepareLoadout` hook hides the declarations of codemode-only tools (and
  * itself) from the model while keeping them active, so codemode scripts can still call them.
  */
 const CODEMODE_ONLY_HELPER_TOOL = "pi_loadout_codemode_only";
+/** System prompt section in which the MCP extension lists servers with codemode/deferred tools. */
+const MCP_SERVERS_SECTION = "mcp_servers";
 const TOOL_MODES = ["direct", "codemode", "deferred", "off"] as const;
 /** Mode names accepted by `/loadout mode` from earlier versions. */
 const TOOL_MODE_ALIASES: Record<string, ToolMode> = { hidden: "off" };
@@ -69,6 +74,8 @@ type StoredState = {
   codemodeTools?: string[];
   /** Tools with `direct` exposure presented as `deferred`: callable from scripts, not listed. */
   deferredTools?: string[];
+  /** Tools with `codemode`/`deferred` exposure (such as MCP tools) turned off: calls are blocked. */
+  disabledTools?: string[];
   profileName?: string;
 };
 
@@ -77,6 +84,7 @@ type Profile = {
   enabledSkills: string[];
   codemodeTools?: string[];
   deferredTools?: string[];
+  disabledTools?: string[];
   updatedAt: string;
 };
 
@@ -104,8 +112,11 @@ type SkillGroup = {
   skills: SkillInfo[];
 };
 
-type Pane = "tools" | "skills" | "presets";
-type LoadoutPresetName = "full" | "minimal";
+type Pane = "tools" | "mcp" | "skills" | "presets";
+const PANES: Pane[] = ["tools", "mcp", "skills", "presets"];
+const PANE_LABELS: Record<Pane, string> = { tools: "Tools", mcp: "MCP", skills: "Skills", presets: "Presets" };
+/** Profile names of the removed `full`/`minimal` presets, still found in older session entries. */
+const LEGACY_PRESET_NAMES = new Set(["full", "minimal"]);
 type RowId =
   | `group:${string}`
   | `tool:${string}`
@@ -118,23 +129,21 @@ type RowRef =
   | { kind: "tool"; group: ToolGroup; tool: ToolInfo }
   | { kind: "skillGroup"; group: SkillGroup }
   | { kind: "skill"; group: SkillGroup; skill: SkillInfo }
-  | { kind: "preset"; name: string; source: "builtin" | "default" | "user"; profile?: Profile };
-
-type LoadoutResult = {
-  enabledTools: Set<string>;
-  codemodeTools: Set<string>;
-  deferredTools: Set<string>;
-  enabledSkills: Set<string>;
-};
+  | { kind: "preset"; name: string; source: "default" | "user"; profile?: Profile };
 
 /**
  * `tools` are declared directly. `codemode` and `deferred` (disjoint) are direct-exposure tools
- * presented with that exposure instead.
+ * presented with that exposure instead. `disabled` are tools with `codemode`/`deferred` exposure
+ * (such as MCP tools) that are turned off.
  */
-type Selection = {
+type ToolSets = {
   tools: Set<string>;
   codemode: Set<string>;
   deferred: Set<string>;
+  disabled: Set<string>;
+};
+
+type Selection = ToolSets & {
   skills: Set<string>;
 };
 
@@ -145,6 +154,8 @@ type LoadoutDiff = {
   codemodeRemoved: string[];
   deferredAdded: string[];
   deferredRemoved: string[];
+  disabledAdded: string[];
+  disabledRemoved: string[];
   skillsAdded: string[];
   skillsRemoved: string[];
 };
@@ -161,6 +172,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   let enabledTools = new Set<string>();
   let codemodeTools = new Set<string>();
   let deferredTools = new Set<string>();
+  let disabledTools = new Set<string>();
   let enabledSkills = new Set<string>();
   let skillLoadoutExplicit = false;
   let currentProfileName: string | undefined;
@@ -169,11 +181,14 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   let pendingDirectTools = new Set<string>();
   let pendingCodemodeTools = new Set<string>();
   let pendingDeferredTools = new Set<string>();
+  let pendingDisabledTools = new Set<string>();
 
   function allTools(): ToolInfo[] {
     const byName = new Map<string, ToolInfo>();
     for (const tool of pi.getAllTools()) {
       if (tool.name === CODEMODE_ONLY_HELPER_TOOL) continue;
+      // `hidden` tools (withdrawn, or hidden by an MCP `toolExposure`) are unreachable; nothing to set.
+      if (tool.exposure === "hidden") continue;
       byName.set(tool.name, tool);
     }
     return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -199,27 +214,33 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return pi.getAllTools().some((tool) => tool.name === CODEMODE_TOOL);
   }
 
+  /** Whether a tool comes from MCP: a server tool (`mcp__<server>__<tool>`) or a resource tool. */
+  function isMcpTool(tool: ToolInfo): boolean {
+    return (
+      tool.name.startsWith("mcp__") ||
+      MCP_RESOURCE_TOOLS.has(tool.name) ||
+      !!tool.namespace?.name.startsWith("mcp__")
+    );
+  }
+
   /** Modes a tool can be set to, given its exposure. */
   function allowedToolModes(tool: ToolInfo, hasCodemode = codemodeRegistered()): ToolMode[] {
     const exposure = toolExposure(tool);
-    // Tools with codemode/deferred exposure are always callable from scripts; they can only be
-    // promoted to direct declarations.
-    if (isIndirectExposure(exposure)) return ["direct", exposure as ToolMode];
+    // Tools with codemode/deferred exposure are callable from scripts whenever registered; they can
+    // be promoted to direct declarations, or turned off (calls are blocked by the loadout). Their
+    // listing is left to their exposure: pi keeps MCP tools (`deferred`) out of the codemode
+    // description so it does not change, and miss the prompt cache, when servers connect.
+    if (isIndirectExposure(exposure)) return ["direct", exposure as ToolMode, "off"];
     if (exposure === "direct" && hasCodemode && tool.name !== CODEMODE_TOOL) return ["direct", "codemode", "deferred", "off"];
     return ["direct", "off"];
   }
 
-  function toolModeOf(
-    tool: ToolInfo,
-    direct: Set<string>,
-    codemode: Set<string>,
-    deferred: Set<string> = new Set(),
-  ): ToolMode {
-    if (direct.has(tool.name)) return "direct";
+  function toolModeOf(tool: ToolInfo, sets: ToolSets): ToolMode {
+    if (sets.tools.has(tool.name)) return "direct";
     const exposure = toolExposure(tool);
-    if (isIndirectExposure(exposure)) return exposure as ToolMode;
-    if (exposure === "direct" && codemode.has(tool.name)) return "codemode";
-    if (exposure === "direct" && deferred.has(tool.name)) return "deferred";
+    if (isIndirectExposure(exposure)) return sets.disabled.has(tool.name) ? "off" : (exposure as ToolMode);
+    if (exposure === "direct" && sets.codemode.has(tool.name)) return "codemode";
+    if (exposure === "direct" && sets.deferred.has(tool.name)) return "deferred";
     return "off";
   }
 
@@ -227,29 +248,25 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   function clampToolMode(tool: ToolInfo, mode: ToolMode, hasCodemode = codemodeRegistered()): ToolMode | undefined {
     const allowed = allowedToolModes(tool, hasCodemode);
     if (allowed.includes(mode)) return mode;
-    // Registered codemode/deferred tools cannot be turned off; demote them to their own exposure.
+    // Tools with codemode/deferred exposure reach scripts with their own exposure.
     const exposure = toolExposure(tool);
-    if (mode === "off" && isIndirectExposure(exposure)) return exposure as ToolMode;
+    if (isIndirectMode(mode) && isIndirectExposure(exposure)) return exposure as ToolMode;
     return undefined;
   }
 
   /** Set a tool's mode in the given sets. Returns false when the mode does not apply to the tool. */
-  function setToolMode(
-    tool: ToolInfo,
-    mode: ToolMode,
-    direct: Set<string>,
-    codemode: Set<string>,
-    deferred: Set<string>,
-    hasCodemode = codemodeRegistered(),
-  ): boolean {
+  function setToolMode(tool: ToolInfo, mode: ToolMode, sets: ToolSets, hasCodemode = codemodeRegistered()): boolean {
     const next = clampToolMode(tool, mode, hasCodemode);
     if (!next) return false;
-    direct.delete(tool.name);
-    codemode.delete(tool.name);
-    deferred.delete(tool.name);
-    if (next === "direct") direct.add(tool.name);
-    else if (next === "codemode" && toolExposure(tool) === "direct") codemode.add(tool.name);
-    else if (next === "deferred" && toolExposure(tool) === "direct") deferred.add(tool.name);
+    const exposure = toolExposure(tool);
+    sets.tools.delete(tool.name);
+    sets.codemode.delete(tool.name);
+    sets.deferred.delete(tool.name);
+    sets.disabled.delete(tool.name);
+    if (next === "direct") sets.tools.add(tool.name);
+    else if (next === "codemode" && exposure === "direct") sets.codemode.add(tool.name);
+    else if (next === "deferred" && exposure === "direct") sets.deferred.add(tool.name);
+    else if (next === "off" && isIndirectExposure(exposure)) sets.disabled.add(tool.name);
     return true;
   }
 
@@ -266,23 +283,22 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return true;
   }
 
-  function countToolModes(
-    direct: Set<string>,
-    codemode: Set<string>,
-    tools = allTools(),
-    deferred: Set<string> = new Set(),
-  ) {
+  function countToolModes(sets: ToolSets, tools = allTools()) {
     const counts: Record<ToolMode, number> = { direct: 0, codemode: 0, deferred: 0, off: 0 };
-    for (const tool of tools) counts[toolModeOf(tool, direct, codemode, deferred)]++;
+    for (const tool of tools) counts[toolModeOf(tool, sets)]++;
     return counts;
   }
 
-  function formatToolCounts(direct: Set<string>, codemode: Set<string>, deferred: Set<string>): string {
-    const tools = allTools();
-    const counts = countToolModes(direct, codemode, tools, deferred);
+  function formatToolCounts(sets: ToolSets): string {
+    const all = allTools();
+    const tools = all.filter((tool) => !isMcpTool(tool));
+    const mcp = all.filter(isMcpTool);
+    const counts = countToolModes(sets, tools);
     const indirect = counts.codemode + counts.deferred;
     const viaCodemode = indirect > 0 ? ` (+${indirect} via codemode)` : "";
-    return `${counts.direct}/${tools.length} tools${viaCodemode}`;
+    if (mcp.length === 0) return `${counts.direct}/${tools.length} tools${viaCodemode}`;
+    const mcpCounts = countToolModes(sets, mcp);
+    return `${counts.direct}/${tools.length} tools${viaCodemode} · ${mcp.length - mcpCounts.off}/${mcp.length} MCP`;
   }
 
   /** Tools currently declared directly, excluding codemode-only tools and the helper. */
@@ -301,27 +317,48 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       tools,
       codemode,
       deferred: normalizeDeferredTools(deferredTools, tools, codemode),
+      disabled: normalizeDisabledTools(disabledTools, tools),
       skills: normalizeEnabledSkills(activeSkillNames()),
     };
   }
 
+  /** Whether calls to a tool are blocked because the loadout turned it off. */
+  function isToolDisabled(name: string): boolean {
+    return disabledTools.has(name) || pendingDisabledTools.has(name);
+  }
+
   /** The active tool set: direct tools, then codemode/deferred tools and the helper that hides them. */
-  function activeSetFor(direct: Set<string>, indirect: Set<string>): string[] {
+  function activeSetFor(direct: Set<string>, indirect: Set<string>, needsHelper: boolean): string[] {
     const names = [...direct].filter((name) => name !== CODEMODE_ONLY_HELPER_TOOL && !indirect.has(name));
-    if (indirect.size === 0) return names;
+    if (indirect.size === 0 && !needsHelper) return names;
     // The helper must come after `codemode` so its codemode description wins.
     return [...names, ...indirect, CODEMODE_ONLY_HELPER_TOOL];
   }
 
-  function applyTools(direct: Set<string>, codemode: Set<string>, deferred: Set<string> = new Set()) {
+  function applyTools(
+    direct: Set<string>,
+    codemode: Set<string>,
+    deferred: Set<string> = new Set(),
+    disabled: Set<string> = new Set(),
+  ) {
     enabledTools = normalizeEnabledTools(direct);
     codemodeTools = normalizeCodemodeTools(codemode, enabledTools);
     deferredTools = normalizeDeferredTools(deferred, enabledTools, codemodeTools);
-    pi.setActiveTools(activeSetFor(enabledTools, new Set([...codemodeTools, ...deferredTools])));
+    disabledTools = normalizeDisabledTools(disabled, enabledTools);
+    // The helper also keeps disabled tools out of the codemode description and out of the
+    // declarations (when tool_search loads them).
+    const needsHelper = disabledTools.size + pendingDisabledTools.size > 0;
+    pi.setActiveTools(activeSetFor(enabledTools, new Set([...codemodeTools, ...deferredTools]), needsHelper));
   }
 
-  function setPendingTools(rawDirect: Iterable<string>, rawCodemode: Iterable<string>, rawDeferred: Iterable<string> = []) {
-    const available = new Set(allToolNames());
+  function setPendingTools(
+    rawDirect: Iterable<string>,
+    rawCodemode: Iterable<string>,
+    rawDeferred: Iterable<string> = [],
+    rawDisabled: Iterable<string> = [],
+  ) {
+    // Every registered name, including hidden tools, which would otherwise stay pending forever.
+    const available = new Set(pi.getAllTools().map((tool) => tool.name));
     pendingDirectTools = new Set([...rawDirect].filter((name) => !available.has(name)));
     pendingCodemodeTools = new Set([...rawCodemode].filter((name) => !available.has(name) && !pendingDirectTools.has(name)));
     pendingDeferredTools = new Set(
@@ -329,39 +366,58 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         (name) => !available.has(name) && !pendingDirectTools.has(name) && !pendingCodemodeTools.has(name),
       ),
     );
+    pendingDisabledTools = new Set(
+      [...rawDisabled].filter(
+        (name) =>
+          !available.has(name) &&
+          !pendingDirectTools.has(name) &&
+          !pendingCodemodeTools.has(name) &&
+          !pendingDeferredTools.has(name),
+      ),
+    );
   }
 
   /** Apply pending tools that have been registered since. Returns true when the loadout changed. */
   function resolvePendingTools(): boolean {
-    if (pendingDirectTools.size === 0 && pendingCodemodeTools.size === 0 && pendingDeferredTools.size === 0) {
+    if (
+      pendingDirectTools.size === 0 &&
+      pendingCodemodeTools.size === 0 &&
+      pendingDeferredTools.size === 0 &&
+      pendingDisabledTools.size === 0
+    ) {
       return false;
     }
     const byName = new Map(allTools().map((tool) => [tool.name, tool]));
-    const direct = currentDirectTools();
-    const codemode = new Set(codemodeTools);
-    const deferred = new Set(deferredTools);
+    const sets: ToolSets = {
+      tools: currentDirectTools(),
+      codemode: new Set(codemodeTools),
+      deferred: new Set(deferredTools),
+      disabled: new Set(disabledTools),
+    };
     let changed = false;
     for (const name of [...pendingDirectTools]) {
       if (!byName.has(name)) continue;
       pendingDirectTools.delete(name);
-      if (!direct.has(name)) changed = true;
-      direct.add(name);
-      codemode.delete(name);
-      deferred.delete(name);
+      if (!sets.tools.has(name)) changed = true;
+      sets.tools.add(name);
+      sets.codemode.delete(name);
+      sets.deferred.delete(name);
+      sets.disabled.delete(name);
     }
     for (const [pending, mode] of [
       [pendingCodemodeTools, "codemode"],
       [pendingDeferredTools, "deferred"],
+      [pendingDisabledTools, "off"],
     ] as const) {
       for (const name of [...pending]) {
         const tool = byName.get(name);
         if (!tool) continue;
         pending.delete(name);
-        const before = toolModeOf(tool, direct, codemode, deferred);
-        if (setToolMode(tool, mode, direct, codemode, deferred) && before !== mode) changed = true;
+        const before = toolModeOf(tool, sets);
+        if (setToolMode(tool, mode, sets) && before !== mode) changed = true;
       }
     }
-    if (changed) applyTools(direct, codemode, deferred);
+    if (changed) applyTools(sets.tools, sets.codemode, sets.deferred, sets.disabled);
     return changed;
   }
 
@@ -411,23 +467,29 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     const hidden = [...codemodeTools, ...deferredTools].filter(
       (name) => declaredNames.has(name) && loadout.getExposure(name) === "direct",
     );
-    const hiddenDeclarations = [CODEMODE_ONLY_HELPER_TOOL, ...hidden];
-    if (hidden.length === 0 || !declaredNames.has(CODEMODE_TOOL)) return { hiddenDeclarations };
+    // Disabled tools are hidden even when declared (for example after tool_search loaded them).
+    const disabledDeclared = [...declaredNames].filter((name) => isToolDisabled(name));
+    const anyDisabled = loadout.callable.some((tool) => isToolDisabled(tool.name));
+    const hiddenDeclarations = [CODEMODE_ONLY_HELPER_TOOL, ...hidden, ...disabledDeclared];
+    if ((hidden.length === 0 && !anyDisabled) || !declaredNames.has(CODEMODE_TOOL)) return { hiddenDeclarations };
 
     // List the codemode-only tools in the codemode description by presenting them to pi's
-    // codemode hook with the exposure their mode names (`codemode` is listed, `deferred` is not).
+    // codemode hook with the exposure their mode names (`codemode` is listed, `deferred` is not),
+    // and leave disabled tools out of it.
     const delegate = getCodemodeDelegate();
     if (!delegate?.prepareLoadout || !isStandardCodemode(delegate)) return { hiddenDeclarations };
     const hiddenSet = new Set(hidden);
     const delegated = delegate.prepareLoadout({
-      declared: loadout.declared.filter((tool) => tool.name !== CODEMODE_ONLY_HELPER_TOOL && !hiddenSet.has(tool.name)),
-      callable: loadout.callable,
-      registered: loadout.registered,
+      declared: loadout.declared.filter(
+        (tool) => tool.name !== CODEMODE_ONLY_HELPER_TOOL && !hiddenSet.has(tool.name) && !isToolDisabled(tool.name),
+      ),
+      callable: loadout.callable.filter((tool) => !isToolDisabled(tool.name)),
+      registered: loadout.registered.filter((tool) => !isToolDisabled(tool.name)),
       getExposure: (name) =>
         hiddenSet.has(name) ? (deferredTools.has(name) ? "deferred" : "codemode") : loadout.getExposure(name),
       getNamespace: (name) => loadout.getNamespace(name),
       getPromptGuidelines: (name: string) =>
-        (loadout as { getPromptGuidelines?: (name: string) => string[] }).getPromptGuidelines?.(name) ?? [],
+        (loadout as unknown as { getPromptGuidelines?: (name: string) => readonly string[] }).getPromptGuidelines?.(name) ?? [],
     } as ToolLoadout);
     return {
       descriptions: delegated?.descriptions,
@@ -446,6 +508,16 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     execute: async () => {
       throw new Error(`${CODEMODE_ONLY_HELPER_TOOL} is an internal pi-loadout helper and cannot be called.`);
     },
+  });
+
+  // Tools with codemode/deferred exposure (such as MCP tools) are callable whenever registered, so
+  // turning them off blocks their calls, including nested calls from codemode scripts.
+  pi.on("tool_call", async (event) => {
+    if (!isToolDisabled(event.toolName)) return;
+    return {
+      block: true,
+      reason: `${event.toolName} is turned off in this session's loadout. Ask the user to enable it with /loadout (MCP tab).`,
+    };
   });
 
   function allSkills(): SkillInfo[] {
@@ -513,6 +585,38 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     });
   }
 
+  /** MCP tools grouped by server (namespace), with the resource tools in a group of their own. */
+  function groupMcpTools(tools: ToolInfo[]): ToolGroup[] {
+    const byKey = new Map<string, ToolGroup>();
+    for (const tool of tools) {
+      let key: string;
+      let label: string;
+      if (MCP_RESOURCE_TOOLS.has(tool.name)) {
+        key = MCP_RESOURCES_GROUP_KEY;
+        label = "MCP resources";
+      } else {
+        const namespace = tool.namespace?.name ?? /^(mcp__.+?)__/.exec(tool.name)?.[1] ?? "mcp__other";
+        key = `mcp:${namespace}`;
+        label = tool.namespace?.aliases?.[0] ?? namespace.replace(/^mcp__/, "");
+      }
+      const group = byKey.get(key);
+      if (group) group.tools.push(tool);
+      else byKey.set(key, { key, label, tools: [tool] });
+    }
+    return [...byKey.values()].sort((a, b) => {
+      if (a.key === MCP_RESOURCES_GROUP_KEY) return 1;
+      if (b.key === MCP_RESOURCES_GROUP_KEY) return -1;
+      return a.label.localeCompare(b.label);
+    });
+  }
+
+  /** Short label of an MCP tool within its server group (`mcp__linear__get_issue` → `get_issue`). */
+  function mcpToolLabel(tool: ToolInfo): string {
+    const namespace = tool.namespace?.name;
+    if (namespace && tool.name.startsWith(`${namespace}__`)) return tool.name.slice(namespace.length + 2);
+    return tool.name;
+  }
+
   function groupSkills(skills: SkillInfo[]): SkillGroup[] {
     const byKey = new Map<string, SkillGroup>();
 
@@ -530,30 +634,21 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return [...byKey.values()].sort((a, b) => a.label.localeCompare(b.label));
   }
 
-  function presetTools(name: LoadoutPresetName): Set<string> {
-    // Codemode/deferred tools (such as MCP tools) stay codemode-only in presets; only tools that
-    // are declared by default are enabled as direct tools.
-    const tools = allTools().filter((tool) => !isIndirectExposure(toolExposure(tool)));
-    if (name === "full") return new Set(tools.map((tool) => tool.name));
-    return new Set(tools.filter((tool) => isBuiltinSource(tool.sourceInfo)).map((tool) => tool.name));
+  /**
+   * Pi's own default: every tool that is declared by default (tools with codemode/deferred
+   * exposure, such as MCP tools, keep their exposure). Used when no loadout was saved and by
+   * `/loadout reset`.
+   */
+  function piDefaultTools(): Set<string> {
+    return new Set(allTools().filter((tool) => !isIndirectExposure(toolExposure(tool))).map((tool) => tool.name));
   }
 
-  function presetSkills(name: LoadoutPresetName): Set<string> {
-    if (name === "full") return new Set(allSkillNames());
-    return new Set(allSkills().filter((skill) => isBuiltinSource(skill.sourceInfo)).map((skill) => skill.name));
-  }
-
-  function presetProfile(name: LoadoutPresetName): Profile {
+  function piDefaultProfile(): Profile {
     return {
-      enabledTools: sorted(presetTools(name)),
-      enabledSkills: sorted(presetSkills(name)),
-      codemodeTools: [],
+      enabledTools: sorted(piDefaultTools()),
+      enabledSkills: sorted(allSkillNames()),
       updatedAt: new Date(0).toISOString(),
     };
-  }
-
-  function isLoadoutPresetName(name: string): name is LoadoutPresetName {
-    return name === "full" || name === "minimal";
   }
 
   function profileFromStoredState(state: StoredState): Profile {
@@ -562,6 +657,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       enabledSkills: sorted(state.enabledSkills ?? allSkillNames()),
       codemodeTools: sorted(state.codemodeTools ?? []),
       deferredTools: sorted(state.deferredTools ?? []),
+      disabledTools: sorted(state.disabledTools ?? []),
       updatedAt: new Date(0).toISOString(),
     };
   }
@@ -573,6 +669,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       tools,
       codemode,
       deferred: normalizeDeferredTools(profile.deferredTools ?? [], tools, codemode),
+      disabled: normalizeDisabledTools(profile.disabledTools ?? [], tools),
       skills: normalizeEnabledSkills(profile.enabledSkills),
     };
   }
@@ -580,10 +677,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   const RESERVED_PROFILE_NAMES = new Set([
     "default",
     "delete",
-    "full",
     "help",
     "list",
-    "minimal",
     "mode",
     "preset",
     "reset",
@@ -610,6 +705,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   }
 
   /** Registered tools with `direct` exposure that are not declared directly. */
+  /** Registered tools with `direct` exposure that are not declared directly. */
   function normalizeCodemodeTools(names: Iterable<string>, direct: Set<string>): Set<string> {
     const byName = new Map(allTools().map((tool) => [tool.name, tool]));
     return new Set(
@@ -623,6 +719,17 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   /** Like `normalizeCodemodeTools`; a tool in both sets stays `codemode`. */
   function normalizeDeferredTools(names: Iterable<string>, direct: Set<string>, codemode: Set<string>): Set<string> {
     return new Set([...normalizeCodemodeTools(names, direct)].filter((name) => !codemode.has(name)));
+  }
+
+  /** Registered tools with `codemode`/`deferred` exposure that are not declared directly. */
+  function normalizeDisabledTools(names: Iterable<string>, direct: Set<string>): Set<string> {
+    const byName = new Map(allTools().map((tool) => [tool.name, tool]));
+    return new Set(
+      [...names].filter((name) => {
+        const tool = byName.get(name);
+        return !!tool && isIndirectExposure(toolExposure(tool)) && !direct.has(name);
+      }),
+    );
   }
 
   function sorted(names: Iterable<string>): string[] {
@@ -645,27 +752,26 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     const deferredTools = Array.isArray(data.deferredTools)
       ? data.deferredTools.filter((name): name is string => typeof name === "string")
       : undefined;
+    const disabledTools = Array.isArray(data.disabledTools)
+      ? data.disabledTools.filter((name): name is string => typeof name === "string")
+      : undefined;
 
-    return { enabledTools, enabledSkills, codemodeTools, deferredTools, profileName };
+    return { enabledTools, enabledSkills, codemodeTools, deferredTools, disabledTools, profileName };
   }
 
-  function toStoredState(
-    nextTools: Set<string>,
-    nextSkills: Set<string>,
-    profileName?: string,
-    nextCodemode: Set<string> = new Set(),
-    nextDeferred: Set<string> = new Set(),
-  ): StoredState {
+  function toStoredState(selection: Selection, profileName?: string): StoredState {
     // Keep tools that are not registered yet so a save made before an MCP server connects
     // does not drop them.
     const state: StoredState = {
-      enabledTools: sorted([...nextTools, ...pendingDirectTools]),
-      enabledSkills: sorted(nextSkills),
+      enabledTools: sorted([...selection.tools, ...pendingDirectTools]),
+      enabledSkills: sorted(selection.skills),
     };
-    const codemode = sorted([...nextCodemode, ...pendingCodemodeTools]);
+    const codemode = sorted([...selection.codemode, ...pendingCodemodeTools]);
     if (codemode.length > 0) state.codemodeTools = codemode;
-    const deferred = sorted([...nextDeferred, ...pendingDeferredTools]);
+    const deferred = sorted([...selection.deferred, ...pendingDeferredTools]);
     if (deferred.length > 0) state.deferredTools = deferred;
+    const disabled = sorted([...selection.disabled, ...pendingDisabledTools]);
+    if (disabled.length > 0) state.disabledTools = disabled;
     if (profileName) state.profileName = profileName;
     return state;
   }
@@ -687,6 +793,9 @@ export default function loadoutExtension(pi: ExtensionAPI) {
               : {}),
             ...(Array.isArray(v.deferredTools)
               ? { deferredTools: v.deferredTools.filter((n): n is string => typeof n === "string") }
+              : {}),
+            ...(Array.isArray(v.disabledTools)
+              ? { disabledTools: v.disabledTools.filter((n): n is string => typeof n === "string") }
               : {}),
             updatedAt: typeof v.updatedAt === "string" ? v.updatedAt : new Date(0).toISOString(),
           };
@@ -717,12 +826,12 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       enabledSkills: sorted(enabledSkills),
       codemodeTools: sorted(codemodeTools),
       deferredTools: sorted(deferredTools),
+      disabledTools: sorted(disabledTools),
       updatedAt: new Date().toISOString(),
     };
   }
 
   function profileForName(name: string): Profile | undefined {
-    if (isLoadoutPresetName(name)) return presetProfile(name);
     if (name === "default") {
       const state = readGlobalLoadout();
       return state ? profileFromStoredState(state) : undefined;
@@ -731,7 +840,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   }
 
   function isUserProfileName(name: string | undefined): name is string {
-    return !!name && !isLoadoutPresetName(name) && name !== "default";
+    return !!name && name !== "default";
   }
 
   function isCurrentDirty(): boolean {
@@ -742,12 +851,14 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     const skills = sorted(enabledSkills).join("\u0001");
     const codemode = sorted(codemodeTools).join("\u0001");
     const deferred = sorted(deferredTools).join("\u0001");
+    const disabled = sorted(disabledTools).join("\u0001");
     const target = selectionFromProfile(profile);
     return (
       tools !== sorted(target.tools).join("\u0001") ||
       skills !== sorted(target.skills).join("\u0001") ||
       codemode !== sorted(target.codemode).join("\u0001") ||
-      deferred !== sorted(target.deferred).join("\u0001")
+      deferred !== sorted(target.deferred).join("\u0001") ||
+      disabled !== sorted(target.disabled).join("\u0001")
     );
   }
 
@@ -787,6 +898,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       codemodeRemoved: setDifference(current.codemode, target.codemode),
       deferredAdded: setDifference(target.deferred, current.deferred),
       deferredRemoved: setDifference(current.deferred, target.deferred),
+      disabledAdded: setDifference(target.disabled, current.disabled),
+      disabledRemoved: setDifference(current.disabled, target.disabled),
       skillsAdded: setDifference(target.skills, current.skills),
       skillsRemoved: setDifference(current.skills, target.skills),
     };
@@ -800,6 +913,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         diff.codemodeRemoved.length +
         diff.deferredAdded.length +
         diff.deferredRemoved.length +
+        diff.disabledAdded.length +
+        diff.disabledRemoved.length +
         diff.skillsAdded.length +
         diff.skillsRemoved.length >
       0
@@ -820,6 +935,9 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     }
     if (diff.deferredAdded.length + diff.deferredRemoved.length > 0) {
       lines.push(`Deferred: ${formatInlineDiff(diff.deferredAdded, diff.deferredRemoved)}`);
+    }
+    if (diff.disabledAdded.length + diff.disabledRemoved.length > 0) {
+      lines.push(`Off: ${formatInlineDiff(diff.disabledAdded, diff.disabledRemoved)}`);
     }
     if (diff.skillsAdded.length + diff.skillsRemoved.length > 0) {
       lines.push(`Skills: ${formatInlineDiff(diff.skillsAdded, diff.skillsRemoved)}`);
@@ -856,13 +974,16 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   function applySelectionInMemory(next: Selection) {
     enabledSkills = normalizeEnabledSkills(next.skills);
     skillLoadoutExplicit = true;
-    applyTools(next.tools, next.codemode, next.deferred);
+    applyTools(next.tools, next.codemode, next.deferred, next.disabled);
   }
 
   function persistEnabled() {
     pi.appendEntry<StoredState>(
       STATE_CUSTOM_TYPE,
-      toStoredState(enabledTools, enabledSkills, currentProfileName, codemodeTools, deferredTools),
+      toStoredState(
+        { tools: enabledTools, codemode: codemodeTools, deferred: deferredTools, disabled: disabledTools, skills: enabledSkills },
+        currentProfileName,
+      ),
     );
   }
 
@@ -873,6 +994,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       tools,
       codemode,
       deferred: normalizeDeferredTools(selection.deferred, tools, codemode),
+      disabled: normalizeDisabledTools(selection.disabled, tools),
       skills: normalizeEnabledSkills(selection.skills),
     };
   }
@@ -895,15 +1017,22 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     if (!hasDiff(diff) && nextProfileName === undefined) return diff;
 
     persistEnabled();
-    if (hasDiff(diff)) logAppliedLoadout(diff, commandSource);
+    if (hasDiff(diff) && sessionHasPrompts(ctx)) logAppliedLoadout(diff, commandSource);
     return diff;
+  }
+
+  /** Loadout log messages are only useful once the conversation has started. */
+  function sessionHasPrompts(ctx: ExtensionContext): boolean {
+    return ctx.sessionManager
+      .getBranch()
+      .some((entry) => entry.type === "message" && (entry as { message?: { role?: string } }).message?.role === "user");
   }
 
   function saveGlobalLoadout(selection: Selection, ctx: ExtensionContext) {
     const target = normalizeSelection(selection);
-    writeGlobalLoadout(toStoredState(target.tools, target.skills, currentProfileName, target.codemode, target.deferred));
+    writeGlobalLoadout(toStoredState(target, currentProfileName));
     ctx.ui.notify(
-      `Saved default loadout: ${formatToolCounts(target.tools, target.codemode, target.deferred)}, ${target.skills.size}/${allSkillNames().length} skills enabled. Future sessions will use it.`,
+      `Saved default loadout: ${formatToolCounts(target)}, ${target.skills.size}/${allSkillNames().length} skills enabled. Future sessions will use it.`,
       "info",
     );
   }
@@ -915,18 +1044,17 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     nextProfileName: string | null,
   ): { diff: LoadoutDiff; target: Selection } {
     const previous = currentSelection();
-    setPendingTools(profile.enabledTools, profile.codemodeTools ?? [], profile.deferredTools ?? []);
+    setPendingTools(profile.enabledTools, profile.codemodeTools ?? [], profile.deferredTools ?? [], profile.disabledTools ?? []);
     const target = selectionFromProfile(profile);
     const diff = commitLoadout(previous, target, ctx, commandSource, nextProfileName);
     return { diff, target };
   }
 
-  function applyPreset(name: LoadoutPresetName, ctx: ExtensionContext, commandSource: string): LoadoutDiff {
-    const { diff, target } = applyProfileSelection(presetProfile(name), ctx, commandSource, name);
-    const label = name === "full" ? "Full" : "Minimal";
+  function resetLoadout(ctx: ExtensionContext, commandSource: string): LoadoutDiff {
+    const { diff, target } = applyProfileSelection(piDefaultProfile(), ctx, commandSource, null);
     const suffix = hasDiff(diff) ? " Next response may miss prompt cache." : " Nothing changed.";
     ctx.ui.notify(
-      `${label} preset applied: ${formatToolCounts(target.tools, target.codemode, target.deferred)}, ${target.skills.size}/${allSkillNames().length} skills enabled.${suffix}`,
+      `Loadout reset to Pi defaults: ${formatToolCounts(target)}, ${target.skills.size}/${allSkillNames().length} skills enabled.${suffix}`,
       "info",
     );
     return diff;
@@ -959,14 +1087,13 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     );
     const suffix = hasDiff(diff) ? " Next response may miss prompt cache." : " Nothing changed.";
     ctx.ui.notify(
-      `Default loadout applied: ${formatToolCounts(target.tools, target.codemode, target.deferred)}, ${target.skills.size}/${allSkillNames().length} skills enabled.${suffix}`,
+      `Default loadout applied: ${formatToolCounts(target)}, ${target.skills.size}/${allSkillNames().length} skills enabled.${suffix}`,
       "info",
     );
     return diff;
   }
 
   function applyNamedLoadout(name: string, ctx: ExtensionContext, commandSource: string): LoadoutDiff | undefined {
-    if (isLoadoutPresetName(name)) return applyPreset(name, ctx, commandSource);
     if (name === "default") return applyDefaultLoadout(ctx, commandSource);
 
     const profile = readProfilesFile().profiles[name];
@@ -978,7 +1105,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     const { diff, target } = applyProfileSelection(profile, ctx, commandSource, name);
     const suffix = hasDiff(diff) ? " Next response may miss prompt cache." : " Nothing changed.";
     ctx.ui.notify(
-      `Preset ${name} applied: ${formatToolCounts(target.tools, target.codemode, target.deferred)}, ${target.skills.size}/${allSkillNames().length} skills enabled.${suffix}`,
+      `Preset ${name} applied: ${formatToolCounts(target)}, ${target.skills.size}/${allSkillNames().length} skills enabled.${suffix}`,
       "info",
     );
     return diff;
@@ -992,13 +1119,14 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     }
 
     const target = normalizeSelection(selection);
-    const state = toStoredState(target.tools, target.skills, undefined, target.codemode, target.deferred);
+    const state = toStoredState(target);
     const file = readProfilesFile();
     file.profiles[name] = {
       enabledTools: state.enabledTools,
       enabledSkills: state.enabledSkills ?? [],
       ...(state.codemodeTools ? { codemodeTools: state.codemodeTools } : {}),
       ...(state.deferredTools ? { deferredTools: state.deferredTools } : {}),
+      ...(state.disabledTools ? { disabledTools: state.disabledTools } : {}),
       updatedAt: new Date().toISOString(),
     };
     writeProfilesFile(file);
@@ -1010,8 +1138,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   }
 
   function deleteUserProfile(name: string, ctx: ExtensionContext) {
-    if (RESERVED_PROFILE_NAMES.has(name) || isLoadoutPresetName(name) || name === "default") {
-      ctx.ui.notify(`Cannot delete built-in preset: ${name}`, "warning");
+    if (RESERVED_PROFILE_NAMES.has(name)) {
+      ctx.ui.notify(`Cannot delete ${name}: not a user preset`, "warning");
       return false;
     }
 
@@ -1034,13 +1162,11 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   function formatProfileSummary(profile: Profile | undefined): string {
     if (!profile) return "not saved";
     const target = selectionFromProfile(profile);
-    return `${formatToolCounts(target.tools, target.codemode, target.deferred)} · ${target.skills.size}/${allSkillNames().length} skills`;
+    return `${formatToolCounts(target)} · ${target.skills.size}/${allSkillNames().length} skills`;
   }
 
   function formatProfileList(): string {
     const lines = ["Loadout presets:"];
-    lines.push(`  full      built-in · ${formatProfileSummary(presetProfile("full"))}`);
-    lines.push(`  minimal   built-in · ${formatProfileSummary(presetProfile("minimal"))}`);
     const defaultState = readGlobalLoadout();
     lines.push(`  default   global · ${formatProfileSummary(defaultState ? profileFromStoredState(defaultState) : undefined)}`);
 
@@ -1056,16 +1182,19 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
   function restoreFromBranch(ctx: ExtensionContext) {
     const state = readBranchLoadout(ctx) ?? readGlobalLoadout();
-    // Built-in presets are dynamic: re-expand them against the currently available
-    // tools/skills instead of replaying a frozen list, so they self-heal when the
-    // installed tool/skill set changes between sessions.
-    if (state?.profileName && isLoadoutPresetName(state.profileName)) {
-      enabledSkills = presetSkills(state.profileName);
-      skillLoadoutExplicit = true;
-      currentProfileName = state.profileName;
-      setPendingTools([], []);
-      applyTools(presetTools(state.profileName), new Set());
-      return;
+    // Entries saved under the removed `full`/`minimal` presets: `full` was re-expanded against the
+    // installed tools, so it becomes Pi's default; `minimal` replays its saved lists. Neither keeps
+    // the preset name, unless a user preset has that name now.
+    if (state?.profileName && LEGACY_PRESET_NAMES.has(state.profileName) && !readProfilesFile().profiles[state.profileName]) {
+      if (state.profileName === "full") {
+        enabledSkills = new Set(allSkillNames());
+        skillLoadoutExplicit = true;
+        currentProfileName = undefined;
+        setPendingTools([], []);
+        applyTools(piDefaultTools(), new Set());
+        return;
+      }
+      state.profileName = undefined;
     }
     skillLoadoutExplicit = !!state?.enabledSkills;
     enabledSkills = state?.enabledSkills ? normalizeEnabledSkills(state.enabledSkills) : new Set(allSkillNames());
@@ -1077,20 +1206,21 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       }
     }
     if (state) {
-      setPendingTools(state.enabledTools, state.codemodeTools ?? [], state.deferredTools ?? []);
+      setPendingTools(state.enabledTools, state.codemodeTools ?? [], state.deferredTools ?? [], state.disabledTools ?? []);
       applyTools(
         new Set(state.enabledTools),
         new Set(state.codemodeTools ?? []),
         new Set(state.deferredTools ?? []),
+        new Set(state.disabledTools ?? []),
       );
     } else {
       setPendingTools([], []);
-      applyTools(presetTools("full"), new Set());
+      applyTools(piDefaultTools(), new Set());
     }
   }
 
   function updateStatus(ctx: ExtensionContext) {
-    const counts = `${formatToolCounts(currentDirectTools(), codemodeTools, deferredTools)} · ${activeSkillNames().length}/${allSkillNames().length} skills`;
+    const counts = `${formatToolCounts(currentSelection())} · ${activeSkillNames().length}/${allSkillNames().length} skills`;
     const prefix = currentProfileName ? `${currentProfileName}${isCurrentDirty() ? "*" : ""} · ` : "";
     ctx.ui.setStatus("loadout", `${prefix}${counts}`);
   }
@@ -1107,10 +1237,69 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return typeof sections === "object" && sections !== null;
   }
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     restoreFromBranch(ctx);
+    // `--loadout <name>` applies a preset (or `default`) once, when Pi starts.
+    const flagLoadout = pi.getFlag("loadout");
+    if (event.reason === "startup" && typeof flagLoadout === "string" && flagLoadout.trim()) {
+      const name = flagLoadout.trim();
+      applyNamedLoadout(name, ctx, `--loadout ${name}`);
+    }
     updateStatus(ctx);
   });
+
+  /** Whether every tool of an MCP server (namespace `mcp__<server>`) is turned off. */
+  function isMcpNamespaceDisabled(namespace: string): boolean {
+    const tools = allTools().filter(
+      (tool) => tool.namespace?.name === namespace || tool.name.startsWith(`${namespace}__`),
+    );
+    if (tools.length > 0) return tools.every((tool) => isToolDisabled(tool.name));
+    // Not connected yet: off when the loadout turns off its tools.
+    return [...pendingDisabledTools].some((name) => name.startsWith(`${namespace}__`));
+  }
+
+  function filterMcpServersText(section: string): string | undefined {
+    const serverLine = /^- (mcp__\w+) \(/;
+    const lines = section.split("\n");
+    const kept = lines.filter((line) => {
+      const match = serverLine.exec(line);
+      return !match || !isMcpNamespaceDisabled(match[1]);
+    });
+    if (kept.length === lines.length) return section;
+    return kept.some((line) => serverLine.test(line)) ? kept.join("\n") : undefined;
+  }
+
+  /**
+   * Leave MCP servers whose tools are all off out of the `mcp_servers` prompt section. The MCP
+   * extension writes the section in its own `before_agent_start` handler, which usually runs after
+   * this one (built-in extensions load last), so writes are intercepted with a proxy.
+   */
+  function filterMcpServersSection(options: { sections?: Record<string, string> }) {
+    const sections = options.sections;
+    if (!sections || typeof sections !== "object") return;
+    if (disabledTools.size + pendingDisabledTools.size === 0) return;
+    const current = sections[MCP_SERVERS_SECTION];
+    if (typeof current === "string") {
+      const next = filterMcpServersText(current);
+      if (next === undefined) delete sections[MCP_SERVERS_SECTION];
+      else sections[MCP_SERVERS_SECTION] = next;
+    }
+    try {
+      options.sections = new Proxy(sections, {
+        set(target, key, value) {
+          if (key === MCP_SERVERS_SECTION && typeof value === "string") {
+            const next = filterMcpServersText(value);
+            if (next === undefined) delete target[key];
+            else target[key] = next;
+            return true;
+          }
+          return Reflect.set(target, key, value);
+        },
+      });
+    } catch {
+      // Sections may not be replaceable on this pi version; the servers stay listed.
+    }
+  }
 
   pi.on("session_tree", async (_event, ctx) => {
     restoreFromBranch(ctx);
@@ -1138,6 +1327,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     // session start), and keep the codemode-only helper after `codemode` in the active order.
     if (resolvePendingTools()) updateStatus(ctx);
     ensureHelperOrder();
+    filterMcpServersSection(event.systemPromptOptions as { sections?: Record<string, string> });
 
     const skills = event.systemPromptOptions.skills ?? [];
     if (skills.length === 0) return;
@@ -1165,23 +1355,25 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   const TOOL_MODE_SYMBOLS: Record<ToolMode, string> = { direct: "●", codemode: "◆", deferred: "◇", off: "○" };
 
   function formatStatus(): string {
-    const direct = currentDirectTools();
-    const codemode = codemodeTools;
-    const deferred = deferredTools;
+    const sets = currentSelection();
     const activeSkills = new Set(activeSkillNames());
     const lines: string[] = [];
-    lines.push(`Active: ${formatToolCounts(direct, codemode, deferred)} · ${activeSkills.size}/${allSkillNames().length} skills`);
+    lines.push(`Active: ${formatToolCounts(sets)} · ${activeSkills.size}/${allSkillNames().length} skills`);
 
-    const toolGroups = groupTools(allTools());
-    if (toolGroups.length > 0) {
-      lines.push("", "Tools (● direct · ◆ codemode · ◇ deferred · ○ off):");
-      for (const group of toolGroups) {
-        const counts = countToolModes(direct, codemode, group.tools, deferred);
+    const tools = allTools();
+    for (const [title, groups, label] of [
+      ["Tools", groupTools(tools.filter((tool) => !isMcpTool(tool))), (tool: ToolInfo) => tool.name],
+      ["MCP", groupMcpTools(tools.filter(isMcpTool)), mcpToolLabel],
+    ] as const) {
+      if (groups.length === 0) continue;
+      lines.push("", `${title} (● direct · ◆ codemode · ◇ deferred · ○ off):`);
+      for (const group of groups) {
+        const counts = countToolModes(sets, group.tools);
         lines.push(
           `  ${group.label} (${counts.direct} direct · ${counts.codemode} codemode · ${counts.deferred} deferred · ${counts.off} off)`,
         );
         for (const t of group.tools) {
-          lines.push(`    ${TOOL_MODE_SYMBOLS[toolModeOf(t, direct, codemode, deferred)]} ${t.name}`);
+          lines.push(`    ${TOOL_MODE_SYMBOLS[toolModeOf(t, sets)]} ${label(t)}`);
         }
       }
     }
@@ -1205,19 +1397,18 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return [
       "/loadout commands:",
       "  /loadout          Open interactive picker",
-      "  /loadout full     Enable every tool (codemode/deferred tools such as MCP keep their exposure) and skill",
-      "  /loadout minimal  Enable only built-in tools and skills",
       "  /loadout default  Apply saved global default loadout",
       "  /loadout save <name>    Save current loadout as user preset",
-      "  /loadout use <name>     Apply built-in, default, or user preset",
-      "  /loadout list           List built-in and user presets",
+      "  /loadout use <name>     Apply the default or a user preset",
+      "  /loadout list           List the default and user presets",
       "  /loadout delete <name>  Delete user preset",
       "  /loadout mode <direct|codemode|deferred|off> <tool...>",
       "                    Set a tool's exposure: declared to the model, called from codemode",
       "                    scripts (listed), called from scripts but unlisted, or off",
-      "                    (tool names accept * wildcards, e.g. mcp__linear__*)",
+      "                    (tool names accept * wildcards: /loadout mode off mcp__linear__*",
+      "                    turns off a whole MCP server)",
       "  /loadout status   Print current active tools and skills",
-      "  /loadout reset    Alias for /loadout full",
+      "  /loadout reset    Reset to Pi's defaults: every tool and skill (MCP tools keep their exposure)",
       "  /loadout help     Show this help",
     ].join("\n");
   }
@@ -1235,6 +1426,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       tools: new Set(previous.tools),
       codemode: new Set(previous.codemode),
       deferred: new Set(previous.deferred),
+      disabled: new Set(previous.disabled),
       skills: previous.skills,
     };
     const changed: string[] = [];
@@ -1253,7 +1445,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           skipped.push(`${tool.name} (${toolExposure(tool)} exposure)`);
           continue;
         }
-        if (setToolMode(tool, mode, next.tools, next.codemode, next.deferred, hasCodemode)) changed.push(tool.name);
+        if (setToolMode(tool, mode, next, hasCodemode)) changed.push(tool.name);
       }
     }
 
@@ -1272,17 +1464,13 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   }
 
   const LOADOUT_SUBCOMMANDS: { value: string; label: string; description: string }[] = [
-    { value: "full", label: "full", description: "Enable every tool and skill (codemode/deferred tools such as MCP keep their exposure)" },
-    { value: "minimal", label: "minimal", description: "Enable only built-in tools and skills" },
     { value: "default", label: "default", description: "Apply saved global default loadout" },
     { value: "save", label: "save", description: "Save current loadout as user preset" },
-    { value: "use", label: "use", description: "Apply built-in, default, or user preset" },
-    { value: "list", label: "list", description: "List built-in and user presets" },
+    { value: "use", label: "use", description: "Apply the default or a user preset" },
+    { value: "list", label: "list", description: "List the default and user presets" },
     { value: "delete", label: "delete", description: "Delete user preset" },
     { value: "rm", label: "rm", description: "Delete user preset" },
     { value: "preset", label: "preset", description: "Apply a named preset" },
-    { value: "preset full", label: "preset full", description: "Enable every tool and skill (codemode/deferred tools such as MCP keep their exposure)" },
-    { value: "preset minimal", label: "preset minimal", description: "Enable only built-in tools and skills" },
     { value: "preset default", label: "preset default", description: "Apply saved global default loadout" },
     { value: "mode", label: "mode", description: "Set tool exposure: direct, codemode, deferred, or off" },
     { value: "mode direct", label: "mode direct", description: "Declare tools directly to the model" },
@@ -1290,9 +1478,14 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     { value: "mode deferred", label: "mode deferred", description: "Call tools only from codemode scripts; not listed (searchTools())" },
     { value: "mode off", label: "mode off", description: "Make tools unreachable" },
     { value: "status", label: "status", description: "Print current active tools and skills" },
-    { value: "reset", label: "reset", description: "Alias for /loadout full" },
+    { value: "reset", label: "reset", description: "Reset to Pi's defaults: every tool and skill" },
     { value: "help", label: "help", description: "Show /loadout subcommand list" },
   ];
+
+  pi.registerFlag("loadout", {
+    description: "Apply a loadout preset (or `default`) at startup",
+    type: "string",
+  });
 
   pi.registerCommand("loadout", {
     description: "Select tool exposure (direct, codemode, deferred, off) and skills for this session",
@@ -1307,18 +1500,23 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       if (modeMatch) {
         const head = `mode ${modeMatch[1]} ${modeMatch[2]}`;
         const partial = modeMatch[3].toLowerCase();
+        const sets = currentSelection();
         return allTools()
           .filter((tool) => tool.name.toLowerCase().startsWith(partial))
           .slice(0, 200)
           .map((tool) => ({
             value: `${head}${tool.name}`,
             label: tool.name,
-            description: `${toolModeOf(tool, currentDirectTools(), codemodeTools, deferredTools)} · ${toolExposure(tool)} exposure`,
+            description: `${toolModeOf(tool, sets)} · ${toolExposure(tool)} exposure`,
           }));
       }
       return [...LOADOUT_SUBCOMMANDS, ...profileItems].filter((item) => item.value.toLowerCase().startsWith(prefix));
     },
     handler: async (args, ctx) => {
+      // MCP servers usually connect after session start, so loadout entries for their tools are
+      // still pending until the next prompt. Apply them now so the picker, status, and `mode`
+      // changes see the saved modes instead of the tools' default exposure.
+      if (resolvePendingTools()) updateStatus(ctx);
       const words = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const subcommand = words[0] ?? "";
 
@@ -1332,13 +1530,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         return;
       }
 
-      if (subcommand === "reset" || subcommand === "full") {
-        applyPreset("full", ctx, `/loadout ${subcommand}`);
-        return;
-      }
-
-      if (subcommand === "minimal") {
-        applyPreset("minimal", ctx, "/loadout minimal");
+      if (subcommand === "reset") {
+        resetLoadout(ctx, "/loadout reset");
         return;
       }
 
@@ -1419,27 +1612,56 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const toolGroups = groupTools(tools);
+      const toolGroups = groupTools(tools.filter((tool) => !isMcpTool(tool)));
+      const mcpGroups = groupMcpTools(tools.filter(isMcpTool));
       const skillGroups = groupSkills(skills);
       const draftEnabledTools = currentDirectTools();
       const draftCodemodeTools = normalizeCodemodeTools(codemodeTools, draftEnabledTools);
       const draftDeferredTools = normalizeDeferredTools(deferredTools, draftEnabledTools, draftCodemodeTools);
+      const draftDisabledTools = normalizeDisabledTools(disabledTools, draftEnabledTools);
+      // Live views of the draft sets (mutated in place), for mode lookups.
+      const draftSets: ToolSets = {
+        tools: draftEnabledTools,
+        codemode: draftCodemodeTools,
+        deferred: draftDeferredTools,
+        disabled: draftDisabledTools,
+      };
       const hasCodemode = codemodeRegistered();
       const draftEnabledSkills = normalizeEnabledSkills(skillLoadoutExplicit ? enabledSkills : allSkillNames());
       const rowRefs = new Map<RowId, RowRef>();
 
       function draftToolMode(tool: ToolInfo): ToolMode {
-        return toolModeOf(tool, draftEnabledTools, draftCodemodeTools, draftDeferredTools);
+        return toolModeOf(tool, draftSets);
       }
 
-      function toolGroupValue(group: ToolGroup): ToolMode | "mixed" {
-        const modes = new Set(group.tools.map(draftToolMode));
-        return modes.size === 1 ? [...modes][0] : "mixed";
+      /** Each tool's mode after setting the whole group to `mode` (tools it does not apply to keep theirs). */
+      function groupOutcome(group: ToolGroup, mode: ToolMode): ToolMode[] {
+        return group.tools.map((tool) => clampToolMode(tool, mode, hasCodemode) ?? draftToolMode(tool));
       }
 
+      /**
+       * Modes the group cycles through: one per distinct outcome. When two modes lead to the same
+       * tool modes (e.g. `codemode` and `deferred` on a server whose tools all have `deferred`
+       * exposure), keep the one that names more of the resulting tool modes.
+       */
       function toolGroupModes(group: ToolGroup): ToolMode[] {
         const allowed = new Set(group.tools.flatMap((tool) => allowedToolModes(tool, hasCodemode)));
-        return TOOL_MODES.filter((mode) => allowed.has(mode));
+        const byOutcome = new Map<string, { mode: ToolMode; score: number; order: number }>();
+        TOOL_MODES.filter((mode) => allowed.has(mode)).forEach((mode, order) => {
+          const outcome = groupOutcome(group, mode);
+          const key = outcome.join(",");
+          const score = outcome.filter((result) => result === mode).length;
+          const existing = byOutcome.get(key);
+          if (!existing) byOutcome.set(key, { mode, score, order });
+          else if (score > existing.score) byOutcome.set(key, { mode, score, order: existing.order });
+        });
+        return [...byOutcome.values()].sort((a, b) => a.order - b.order).map((entry) => entry.mode);
+      }
+
+      /** The group mode whose outcome matches the tools' current modes, else `mixed`. */
+      function toolGroupValue(group: ToolGroup): ToolMode | "mixed" {
+        const current = group.tools.map(draftToolMode).join(",");
+        return toolGroupModes(group).find((mode) => groupOutcome(group, mode).join(",") === current) ?? "mixed";
       }
 
       function draftSelection(): Selection {
@@ -1447,6 +1669,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           tools: new Set(draftEnabledTools),
           codemode: new Set(draftCodemodeTools),
           deferred: new Set(draftDeferredTools),
+          disabled: new Set(draftDisabledTools),
           skills: new Set(draftEnabledSkills),
         };
       }
@@ -1458,30 +1681,38 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         return "partial";
       }
 
-      const collapsedToolGroups = new Set<string>();
+      // MCP servers start collapsed so the pane reads as a list of servers.
+      const collapsedToolGroups = new Set<string>(mcpGroups.length > 1 ? mcpGroups.map((group) => group.key) : []);
       const collapsedSkillGroups = new Set<string>();
       let searchQuery = "";
-      let pane: Pane = tools.length > 0 ? "tools" : "skills";
+      const panes = PANES.filter((candidate) => candidate !== "mcp" || mcpGroups.length > 0);
+      let pane: Pane = toolGroups.length > 0 ? "tools" : mcpGroups.length > 0 ? "mcp" : "skills";
 
       function matchesQuery(text: string): boolean {
         return fuzzyMatch(searchQuery, text).matches;
       }
       let visibleRowIds: RowId[] = [];
-      const paneSelectedIndex: Record<Pane, number> = { tools: 0, skills: 0, presets: 0 };
+      const paneSelectedIndex: Record<Pane, number> = { tools: 0, mcp: 0, skills: 0, presets: 0 };
 
       function toolGroupDescription(group: ToolGroup): string {
-        const counts = countToolModes(draftEnabledTools, draftCodemodeTools, group.tools, draftDeferredTools);
+        const counts = countToolModes(draftSets, group.tools);
         const collapsed = collapsedToolGroups.has(group.key) ? "collapsed" : "expanded";
-        const modeCounts = hasCodemode
-          ? `${counts.direct} direct · ${counts.codemode} codemode · ${counts.deferred} deferred · ${counts.off} off`
-          : `${counts.direct}/${group.tools.length} enabled`;
-        return `${group.label} · ${modeCounts} · ${collapsed} · Space cycles ${toolGroupModes(group).join("/")} for group · Enter expands/collapses`;
+        const isMcpGroup = group.key.startsWith("mcp:");
+        const modeCounts =
+          hasCodemode || isMcpGroup
+            ? `${counts.direct} direct · ${counts.codemode} codemode · ${counts.deferred} deferred · ${counts.off} off`
+            : `${counts.direct}/${group.tools.length} enabled`;
+        const title = isMcpGroup && group.key !== MCP_RESOURCES_GROUP_KEY ? `MCP server ${group.label}` : group.label;
+        const summary = group.tools[0]?.namespace?.description;
+        const action = isMcpGroup ? "for whole server" : "for group";
+        return `${title}${summary ? ` · ${summary}` : ""} · ${modeCounts} · ${collapsed} · Space cycles ${toolGroupModes(group).join("/")} ${action} · Enter expands/collapses`;
       }
 
       function toolDescription(group: ToolGroup, tool: ToolInfo): string {
         const exposure = toolExposure(tool);
         const exposureNote = exposure === "direct" ? "" : ` · ${exposure} exposure`;
-        const base = tool.description ? `${group.label}${exposureNote} · ${tool.description}` : `${group.label}${exposureNote}`;
+        const title = group.key.startsWith("mcp:") ? tool.name : group.label;
+        const base = tool.description ? `${title}${exposureNote} · ${tool.description}` : `${title}${exposureNote}`;
         return `${base} · Space cycles ${allowedToolModes(tool, hasCodemode).join("/")}`;
       }
 
@@ -1491,11 +1722,11 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         return `${group.label} · ${count}/${group.skills.length} enabled · ${collapsed} · Space toggles group · Enter expands/collapses`;
       }
 
-      function buildToolItems(): SettingItem[] {
+      function buildToolItems(groups: ToolGroup[], mcp: boolean): SettingItem[] {
         const items: SettingItem[] = [];
         const query = searchQuery.trim();
 
-        for (const group of toolGroups) {
+        for (const group of groups) {
           const groupMatch = query === "" || matchesQuery(group.label);
           const tools =
             query === "" || groupMatch ? group.tools : group.tools.filter((tool) => matchesQuery(tool.name));
@@ -1507,7 +1738,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           visibleRowIds.push(groupId);
           items.push({
             id: groupId,
-            label: `${collapsed ? "▸" : "▾"} ${group.label}`,
+            label: `${collapsed ? "▸" : "▾"} ${group.label}${mcp ? ` (${group.tools.length})` : ""}`,
             description: toolGroupDescription(group),
             currentValue: toolGroupValue(group),
             values: toolGroupModes(group),
@@ -1522,7 +1753,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             visibleRowIds.push(toolId);
             items.push({
               id: toolId,
-              label: `  ${branch} ${tool.name}`,
+              label: `  ${branch} ${mcp ? mcpToolLabel(tool) : tool.name}`,
               description: toolDescription(group, tool),
               currentValue: draftToolMode(tool),
               values: allowedToolModes(tool, hasCodemode),
@@ -1579,9 +1810,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         const items: SettingItem[] = [];
         const query = searchQuery.trim();
         const defaultState = readGlobalLoadout();
-        const presets: Array<{ name: string; source: "builtin" | "default" | "user"; profile?: Profile }> = [
-          { name: "full", source: "builtin", profile: presetProfile("full") },
-          { name: "minimal", source: "builtin", profile: presetProfile("minimal") },
+        const presets: Array<{ name: string; source: "default" | "user"; profile?: Profile }> = [
           { name: "default", source: "default", profile: defaultState ? profileFromStoredState(defaultState) : undefined },
           ...Object.entries(readProfilesFile().profiles).map(([name, profile]) => ({ name, source: "user" as const, profile })),
         ];
@@ -1589,8 +1818,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         for (const preset of presets) {
           if (query !== "" && !matchesQuery(preset.name) && !matchesQuery(preset.source)) continue;
           const presetId = `preset:${preset.name}` as RowId;
-          const toolsCount = preset.profile ? normalizeEnabledTools(preset.profile.enabledTools).size : 0;
-          const skillsCount = preset.profile ? normalizeEnabledSkills(preset.profile.enabledSkills).size : 0;
+          const summary = formatProfileSummary(preset.profile);
           rowRefs.set(presetId, { kind: "preset", ...preset });
           visibleRowIds.push(presetId);
           items.push({
@@ -1598,12 +1826,10 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             label: preset.name,
             description:
               preset.source === "user"
-                ? `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · updated ${formatRelativeTime(preset.profile?.updatedAt ?? "")} · Space/Enter applies · Ctrl+D deletes`
-                : preset.source === "default"
-                  ? preset.profile
-                    ? `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · saved global default · Space/Enter applies`
-                    : `No global default saved at ${GLOBAL_LOADOUT_PATH} · Ctrl+S saves one`
-                  : `${toolsCount}/${allToolNames().length} tools · ${skillsCount}/${allSkillNames().length} skills · built-in · Space/Enter applies`,
+                ? `${summary} · updated ${formatRelativeTime(preset.profile?.updatedAt ?? "")} · Space/Enter applies · Ctrl+D deletes`
+                : preset.profile
+                  ? `${summary} · saved global default · Space/Enter applies`
+                  : `No global default saved at ${GLOBAL_LOADOUT_PATH} · Ctrl+S saves one`,
             currentValue: currentProfileName === preset.name ? (isCurrentDirty() ? "active*" : "active") : preset.source,
             values: ["apply"],
           });
@@ -1615,14 +1841,15 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       function buildItems(): SettingItem[] {
         visibleRowIds = [];
         rowRefs.clear();
-        if (pane === "tools") return buildToolItems();
+        if (pane === "tools") return buildToolItems(toolGroups, false);
+        if (pane === "mcp") return buildToolItems(mcpGroups, true);
         if (pane === "skills") return buildSkillItems();
         return buildPresetItems();
       }
 
       const initialSelection = currentSelection();
 
-      const result = await ctx.ui.custom<LoadoutResult | undefined>((tui, theme, _keybindings, done) => {
+      const result = await ctx.ui.custom<Selection | undefined>((tui, theme, _keybindings, done) => {
         let settingsList: SettingsList;
         let selectedIndex = paneSelectedIndex[pane];
         let helpVisible = false;
@@ -1635,17 +1862,33 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         const cacheNoteText = new Text("", 1, 0);
 
         function updateHeader() {
-          const toolsLabel = pane === "tools" ? theme.fg("accent", theme.bold("[Tools]")) : theme.fg("dim", "Tools");
-          const skillsLabel = pane === "skills" ? theme.fg("accent", theme.bold("[Skills]")) : theme.fg("dim", "Skills");
-          const presetsLabel = pane === "presets" ? theme.fg("accent", theme.bold("[Presets]")) : theme.fg("dim", "Presets");
-          headerText.setText(`${toolsLabel}  ${skillsLabel}  ${presetsLabel}`);
-          searchLabel.setText(theme.fg("dim", pane === "presets" ? "Filter presets, or type a name then Ctrl+P to save:" : "Search (filter by tool, skill, or extension name):"));
+          headerText.setText(
+            panes
+              .map((candidate) =>
+                candidate === pane
+                  ? theme.fg("accent", theme.bold(`[${PANE_LABELS[candidate]}]`))
+                  : theme.fg("dim", PANE_LABELS[candidate]),
+              )
+              .join("  "),
+          );
+          searchLabel.setText(
+            theme.fg(
+              "dim",
+              pane === "presets"
+                ? "Filter presets, or type a name then Ctrl+P to save:"
+                : pane === "mcp"
+                  ? "Search (filter by MCP server or tool name):"
+                  : "Search (filter by tool, skill, or extension name):",
+            ),
+          );
           hintText.setText(
             theme.fg(
               "dim",
               pane === "presets"
                 ? "Type to filter or name • Tab switch pane • Space/Enter apply • Ctrl+P save • Ctrl+D delete • ? shortcuts • Esc clear/close"
-                : pane === "tools" && hasCodemode
+                : pane === "mcp"
+                  ? "Type to search • Tab switch pane • Space cycle server/tool mode (○ off blocks calls) • Enter expand • Ctrl+S save default • ? shortcuts • Esc clear/close"
+                  : pane === "tools" && hasCodemode
                   ? "Type to search • Tab switch pane • Space cycle direct/codemode/deferred/off • Enter collapse • Ctrl+S save default • ? shortcuts • Esc clear/close"
                   : "Type to search • Tab switch pane • Space toggle • Enter collapse • Ctrl+S save default • ? shortcuts • Esc clear/close",
             ),
@@ -1685,8 +1928,8 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         }
 
         function refreshValues() {
-          if (pane === "tools") {
-            for (const group of toolGroups) {
+          if (pane === "tools" || pane === "mcp") {
+            for (const group of pane === "tools" ? toolGroups : mcpGroups) {
               const groupId = `group:${group.key}`;
               settingsList.updateValue(groupId, toolGroupValue(group));
               const item = items.find((item) => item.id === groupId);
@@ -1751,9 +1994,11 @@ export default function loadoutExtension(pi: ExtensionAPI) {
           for (const name of target.codemode) draftCodemodeTools.add(name);
           draftDeferredTools.clear();
           for (const name of target.deferred) draftDeferredTools.add(name);
+          draftDisabledTools.clear();
+          for (const name of target.disabled) draftDisabledTools.add(name);
           draftEnabledSkills.clear();
           for (const name of target.skills) draftEnabledSkills.add(name);
-          setPendingTools(row.profile.enabledTools, row.profile.codemodeTools ?? [], row.profile.deferredTools ?? []);
+          setPendingTools(row.profile.enabledTools, row.profile.codemodeTools ?? [], row.profile.deferredTools ?? [], row.profile.disabledTools ?? []);
           applySelectionInMemory(draftSelection());
           if (row.source === "default") {
             currentProfileName = readGlobalLoadout()?.profileName;
@@ -1767,7 +2012,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
         function switchPane() {
           syncSelectedIndex();
-          pane = pane === "tools" ? "skills" : pane === "skills" ? "presets" : "tools";
+          pane = panes[(panes.indexOf(pane) + 1) % panes.length];
           selectedIndex = paneSelectedIndex[pane];
           rebuildItems();
         }
@@ -1828,12 +2073,12 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             if (row.kind === "toolGroup") {
               const mode = newValue as ToolMode;
               for (const tool of row.group.tools) {
-                setToolMode(tool, mode, draftEnabledTools, draftCodemodeTools, draftDeferredTools, hasCodemode);
+                setToolMode(tool, mode, draftSets, hasCodemode);
               }
               if (isIndirectMode(mode)) ensureCodemodeEnabled(draftEnabledTools, ctx);
             } else if (row.kind === "tool") {
               const mode = newValue as ToolMode;
-              setToolMode(row.tool, mode, draftEnabledTools, draftCodemodeTools, draftDeferredTools, hasCodemode);
+              setToolMode(row.tool, mode, draftSets, hasCodemode);
               if (isIndirectMode(mode)) ensureCodemodeEnabled(draftEnabledTools, ctx);
             } else if (row.kind === "skillGroup") {
               for (const skill of row.group.skills) {
@@ -1858,12 +2103,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
               );
             }
           },
-          () => done({
-              enabledTools: new Set(draftEnabledTools),
-              codemodeTools: new Set(draftCodemodeTools),
-              deferredTools: new Set(draftDeferredTools),
-              enabledSkills: new Set(draftEnabledSkills),
-            }),
+          () => done(draftSelection()),
         );
 
         // Fixed-height wrapper: SettingsList's height varies with item count, the scroll
@@ -1924,7 +2164,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         const helpBody = new Text(
           [
             theme.fg("borderAccent", "Global"),
-            `  ${theme.bold("Tab")}      Switch Tools / Skills / Presets`,
+            `  ${theme.bold("Tab")}      Switch ${panes.map((candidate) => PANE_LABELS[candidate]).join(" / ")}`,
             `  ${theme.bold("↑ ↓")}      Navigate`,
             `  ${theme.bold("Type")}     Search / filter (Presets: also the new preset name)`,
             `  ${theme.bold("Ctrl+S")}   Save current selection as global default`,
@@ -1933,6 +2173,11 @@ export default function loadoutExtension(pi: ExtensionAPI) {
             theme.fg("borderAccent", "Tools / Skills"),
             `  ${theme.bold("Space")}    Toggle selected item or group (tools cycle direct → codemode → deferred → off)`,
             `  ${theme.bold("Enter")}    Expand / collapse selected group`,
+            "",
+            theme.fg("borderAccent", "MCP"),
+            `  ${theme.bold("Space")}    On a server: cycle all its tools; on a tool: cycle that tool`,
+            `           direct → codemode/deferred (server exposure) → off (calls blocked)`,
+            `  ${theme.bold("Enter")}    Expand / collapse server`,
             "",
             theme.fg("borderAccent", "Presets"),
             `  ${theme.bold("Space")}    Apply selected preset`,
@@ -1985,7 +2230,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
               const row = rowRefs.get(selectedId);
               if (!row || row.kind !== "preset") return;
               if (row.source !== "user") {
-                ctx.ui.notify(`Cannot delete built-in preset: ${row.name}`, "warning");
+                ctx.ui.notify("The global default is not a user preset; Ctrl+S overwrites it.", "warning");
                 return;
               }
               if (deleteUserProfile(row.name, ctx)) rebuildItems();
@@ -2016,12 +2261,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
                 applySearch();
                 return;
               }
-              done({
-              enabledTools: new Set(draftEnabledTools),
-              codemodeTools: new Set(draftCodemodeTools),
-              deferredTools: new Set(draftDeferredTools),
-              enabledSkills: new Set(draftEnabledSkills),
-            });
+              done(draftSelection());
               return;
             }
 
@@ -2054,9 +2294,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
 
       commitLoadout(
         initialSelection,
-        result
-          ? { tools: result.enabledTools, codemode: result.codemodeTools, deferred: result.deferredTools, skills: result.enabledSkills }
-          : draftSelection(),
+        result ?? draftSelection(),
         ctx,
         "/loadout",
       );
