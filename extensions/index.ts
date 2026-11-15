@@ -1848,6 +1848,9 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       }
 
       const initialSelection = currentSelection();
+      // Applying a preset updates `currentProfileName` live; remember the starting name so a preset
+      // switch is persisted on close even when the tool/skill selection itself is unchanged.
+      const initialProfileName = currentProfileName;
 
       const result = await ctx.ui.custom<Selection | undefined>((tui, theme, _keybindings, done) => {
         let settingsList: SettingsList;
@@ -2297,6 +2300,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         result ?? draftSelection(),
         ctx,
         "/loadout",
+        currentProfileName !== initialProfileName ? (currentProfileName ?? null) : undefined,
       );
     },
   });
