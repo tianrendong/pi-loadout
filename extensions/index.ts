@@ -182,6 +182,12 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   let pendingCodemodeTools = new Set<string>();
   let pendingDeferredTools = new Set<string>();
   let pendingDisabledTools = new Set<string>();
+  // Whether a loadout has been applied in this process (reset on startup/reload).
+  let hasAppliedLoadout = false;
+  // Non-indirect tools that were registered but inactive at startup/reload (e.g. `defaultActive:
+  // false` tools activated on demand by another extension). Non-explicit restores leave them
+  // untouched so they are neither re-activated without authorization nor clobbered on /tree.
+  let startupInactiveDirectTools = new Set<string>();
 
   function allTools(): ToolInfo[] {
     const byName = new Map<string, ToolInfo>();
@@ -335,20 +341,146 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return [...names, ...indirect, CODEMODE_ONLY_HELPER_TOOL];
   }
 
+  function captureStartupInactiveTools() {
+    const active = new Set(activeToolNames());
+    startupInactiveDirectTools = new Set(
+      allTools()
+        .filter((tool) => !isIndirectExposure(toolExposure(tool)) && !active.has(tool.name))
+        .map((tool) => tool.name),
+    );
+  }
+
+  function appliedToolSets(): ToolSets {
+    return {
+      tools: new Set(enabledTools),
+      codemode: new Set(codemodeTools),
+      deferred: new Set(deferredTools),
+      disabled: new Set(disabledTools),
+    };
+  }
+
+  function normalizeToolSets(sets: ToolSets): ToolSets {
+    const tools = normalizeEnabledTools(sets.tools);
+    const codemode = normalizeCodemodeTools(sets.codemode, tools);
+    return {
+      tools,
+      codemode,
+      deferred: normalizeDeferredTools(sets.deferred, tools, codemode),
+      disabled: normalizeDisabledTools(sets.disabled, tools),
+    };
+  }
+
+  function needsCodemodeHelper(sets: ToolSets, pendingDisabled = pendingDisabledTools): boolean {
+    return sets.codemode.size > 0 || sets.deferred.size > 0 || sets.disabled.size + pendingDisabled.size > 0;
+  }
+
+  /** Whether `tool` must be in `pi.setActiveTools()` to realize `mode`. */
+  function modeRequiresActive(tool: ToolInfo, mode: ToolMode): boolean {
+    if (mode === "direct") return true;
+    if (mode === "off") return false;
+    // Direct-exposure tools in codemode/deferred mode stay active and are hidden by the helper.
+    // Indirect-exposure tools (e.g. MCP) are reachable via codemode without being active.
+    return toolExposure(tool) === "direct";
+  }
+
+  function arraysEqual(a: string[], b: string[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+
   function applyTools(
     direct: Set<string>,
     codemode: Set<string>,
     deferred: Set<string> = new Set(),
     disabled: Set<string> = new Set(),
   ) {
-    enabledTools = normalizeEnabledTools(direct);
-    codemodeTools = normalizeCodemodeTools(codemode, enabledTools);
-    deferredTools = normalizeDeferredTools(deferred, enabledTools, codemodeTools);
-    disabledTools = normalizeDisabledTools(disabled, enabledTools);
+    const next = normalizeToolSets({ tools: direct, codemode, deferred, disabled });
+    enabledTools = next.tools;
+    codemodeTools = next.codemode;
+    deferredTools = next.deferred;
+    disabledTools = next.disabled;
+    hasAppliedLoadout = true;
     // The helper also keeps disabled tools out of the codemode description and out of the
     // declarations (when tool_search loads them).
     const needsHelper = disabledTools.size + pendingDisabledTools.size > 0;
     pi.setActiveTools(activeSetFor(enabledTools, new Set([...codemodeTools, ...deferredTools]), needsHelper));
+  }
+
+  /**
+   * Apply only the delta between `prev` and `next` onto `pi.getActiveTools()`, leaving tools whose
+   * mode did not change (including runtime-activated tools owned by other extensions) untouched.
+   * Maintains the codemode-only helper presence and ordering invariant.
+   */
+  function applyToolsDelta(
+    prev: ToolSets,
+    next: ToolSets,
+    options?: { skipTools?: Set<string> },
+  ): boolean {
+    const normalizedNext = normalizeToolSets(next);
+    const skip = options?.skipTools;
+
+    const toAdd: string[] = [];
+    const toRemove = new Set<string>();
+    let modeChanged = false;
+
+    for (const tool of allTools()) {
+      if (skip?.has(tool.name)) continue;
+      const prevMode = toolModeOf(tool, prev);
+      const nextMode = toolModeOf(tool, normalizedNext);
+      if (prevMode === nextMode) continue;
+      modeChanged = true;
+      if (modeRequiresActive(tool, nextMode)) toAdd.push(tool.name);
+      else toRemove.add(tool.name);
+    }
+
+    enabledTools = normalizedNext.tools;
+    codemodeTools = normalizedNext.codemode;
+    deferredTools = normalizedNext.deferred;
+    disabledTools = normalizedNext.disabled;
+    hasAppliedLoadout = true;
+
+    const currentActive = activeToolNames();
+    const wantHelper = needsCodemodeHelper(normalizedNext);
+    const hasHelper = currentActive.includes(CODEMODE_ONLY_HELPER_TOOL);
+    const helperMisordered =
+      wantHelper &&
+      hasHelper &&
+      currentActive.indexOf(CODEMODE_TOOL) > currentActive.indexOf(CODEMODE_ONLY_HELPER_TOOL);
+
+    if (!modeChanged && wantHelper === hasHelper && !helperMisordered) {
+      return false;
+    }
+
+    const nextActive = currentActive.filter(
+      (name) => !toRemove.has(name) && (wantHelper || name !== CODEMODE_ONLY_HELPER_TOOL),
+    );
+    const nextActiveSet = new Set(nextActive);
+    for (const name of toAdd) {
+      if (!nextActiveSet.has(name)) {
+        nextActive.push(name);
+        nextActiveSet.add(name);
+      }
+    }
+    if (wantHelper) {
+      const helperIndex = nextActive.indexOf(CODEMODE_ONLY_HELPER_TOOL);
+      const codemodeIndex = nextActive.indexOf(CODEMODE_TOOL);
+      if (helperIndex === -1) {
+        nextActive.push(CODEMODE_ONLY_HELPER_TOOL);
+      } else if (codemodeIndex > helperIndex) {
+        nextActive.splice(helperIndex, 1);
+        nextActive.push(CODEMODE_ONLY_HELPER_TOOL);
+      }
+    }
+
+    // Re-run setActiveTools whenever any mode changed (even if the active tool names array is
+    // unchanged, e.g. codemode <-> direct) so Pi re-evaluates prepareLoadout hooks.
+    if (modeChanged || !arraysEqual(currentActive, nextActive)) {
+      pi.setActiveTools(nextActive);
+    }
+    return true;
   }
 
   function setPendingTools(
@@ -388,21 +520,19 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       return false;
     }
     const byName = new Map(allTools().map((tool) => [tool.name, tool]));
-    const sets: ToolSets = {
-      tools: currentDirectTools(),
-      codemode: new Set(codemodeTools),
-      deferred: new Set(deferredTools),
-      disabled: new Set(disabledTools),
-    };
+    const prev = appliedToolSets();
+    const prevNeedsHelper = needsCodemodeHelper(prev);
+    const next = appliedToolSets();
     let changed = false;
     for (const name of [...pendingDirectTools]) {
-      if (!byName.has(name)) continue;
+      const tool = byName.get(name);
+      if (!tool) continue;
       pendingDirectTools.delete(name);
-      if (!sets.tools.has(name)) changed = true;
-      sets.tools.add(name);
-      sets.codemode.delete(name);
-      sets.deferred.delete(name);
-      sets.disabled.delete(name);
+      if (toolModeOf(tool, next) !== "direct") changed = true;
+      next.tools.add(name);
+      next.codemode.delete(name);
+      next.deferred.delete(name);
+      next.disabled.delete(name);
     }
     for (const [pending, mode] of [
       [pendingCodemodeTools, "codemode"],
@@ -413,11 +543,14 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         const tool = byName.get(name);
         if (!tool) continue;
         pending.delete(name);
-        const before = toolModeOf(tool, sets);
-        if (setToolMode(tool, mode, sets) && before !== mode) changed = true;
+        const before = toolModeOf(tool, next);
+        if (setToolMode(tool, mode, next) && before !== mode) changed = true;
       }
     }
-    if (changed) applyTools(sets.tools, sets.codemode, sets.deferred, sets.disabled);
+    const nextNeedsHelper = needsCodemodeHelper(next);
+    if (changed || prevNeedsHelper !== nextNeedsHelper) {
+      applyToolsDelta(prev, next);
+    }
     return changed;
   }
 
@@ -610,7 +743,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     });
   }
 
-  /** Short label of an MCP tool within its server group (`mcp__linear__get_issue` → `get_issue`). */
+  /** Short label of an MCP tool within its server group (`mcp__example__get_item` → `get_item`). */
   function mcpToolLabel(tool: ToolInfo): string {
     const namespace = tool.namespace?.name;
     if (namespace && tool.name.startsWith(`${namespace}__`)) return tool.name.slice(namespace.length + 2);
@@ -640,7 +773,11 @@ export default function loadoutExtension(pi: ExtensionAPI) {
    * `/loadout reset`.
    */
   function piDefaultTools(): Set<string> {
-    return new Set(allTools().filter((tool) => !isIndirectExposure(toolExposure(tool))).map((tool) => tool.name));
+    return new Set(
+      allTools()
+        .filter((tool) => !isIndirectExposure(toolExposure(tool)) && !startupInactiveDirectTools.has(tool.name))
+        .map((tool) => tool.name),
+    );
   }
 
   function piDefaultProfile(): Profile {
@@ -1180,7 +1317,28 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     return lines.join("\n");
   }
 
+  function withoutStartupInactive(sets: ToolSets): ToolSets {
+    if (startupInactiveDirectTools.size === 0) return sets;
+    return {
+      tools: new Set([...sets.tools].filter((name) => !startupInactiveDirectTools.has(name))),
+      codemode: new Set([...sets.codemode].filter((name) => !startupInactiveDirectTools.has(name))),
+      deferred: new Set([...sets.deferred].filter((name) => !startupInactiveDirectTools.has(name))),
+      disabled: new Set(sets.disabled),
+    };
+  }
+
   function restoreFromBranch(ctx: ExtensionContext) {
+    // On first restore (startup/reload), baseline is Pi's initial active tools; afterwards it is
+    // the previously applied loadout state so runtime-activated tools stay untouched.
+    const prev: ToolSets = hasAppliedLoadout
+      ? appliedToolSets()
+      : {
+          tools: currentDirectTools(),
+          codemode: new Set(),
+          deferred: new Set(),
+          disabled: new Set(),
+        };
+
     const state = readBranchLoadout(ctx) ?? readGlobalLoadout();
     // Entries saved under the removed `full`/`minimal` presets: `full` was re-expanded against the
     // installed tools, so it becomes Pi's default; `minimal` replays its saved lists. Neither keeps
@@ -1191,7 +1349,11 @@ export default function loadoutExtension(pi: ExtensionAPI) {
         skillLoadoutExplicit = true;
         currentProfileName = undefined;
         setPendingTools([], []);
-        applyTools(piDefaultTools(), new Set());
+        applyToolsDelta(
+          prev,
+          { tools: piDefaultTools(), codemode: new Set(), deferred: new Set(), disabled: new Set() },
+          { skipTools: startupInactiveDirectTools },
+        );
         return;
       }
       state.profileName = undefined;
@@ -1207,15 +1369,20 @@ export default function loadoutExtension(pi: ExtensionAPI) {
     }
     if (state) {
       setPendingTools(state.enabledTools, state.codemodeTools ?? [], state.deferredTools ?? [], state.disabledTools ?? []);
-      applyTools(
-        new Set(state.enabledTools),
-        new Set(state.codemodeTools ?? []),
-        new Set(state.deferredTools ?? []),
-        new Set(state.disabledTools ?? []),
-      );
+      const next = withoutStartupInactive({
+        tools: new Set(state.enabledTools),
+        codemode: new Set(state.codemodeTools ?? []),
+        deferred: new Set(state.deferredTools ?? []),
+        disabled: new Set(state.disabledTools ?? []),
+      });
+      applyToolsDelta(prev, next, { skipTools: startupInactiveDirectTools });
     } else {
       setPendingTools([], []);
-      applyTools(piDefaultTools(), new Set());
+      applyToolsDelta(
+        prev,
+        { tools: piDefaultTools(), codemode: new Set(), deferred: new Set(), disabled: new Set() },
+        { skipTools: startupInactiveDirectTools },
+      );
     }
   }
 
@@ -1238,6 +1405,10 @@ export default function loadoutExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (event, ctx) => {
+    if (event.reason === "startup" || event.reason === "reload") {
+      hasAppliedLoadout = false;
+      captureStartupInactiveTools();
+    }
     restoreFromBranch(ctx);
     // `--loadout <name>` applies a preset (or `default`) once, when Pi starts.
     const flagLoadout = pi.getFlag("loadout");
@@ -1405,7 +1576,7 @@ export default function loadoutExtension(pi: ExtensionAPI) {
       "  /loadout mode <direct|codemode|deferred|off> <tool...>",
       "                    Set a tool's exposure: declared to the model, called from codemode",
       "                    scripts (listed), called from scripts but unlisted, or off",
-      "                    (tool names accept * wildcards: /loadout mode off mcp__linear__*",
+      "                    (tool names accept * wildcards: /loadout mode off mcp__example__*",
       "                    turns off a whole MCP server)",
       "  /loadout status   Print current active tools and skills",
       "  /loadout reset    Reset to Pi's defaults: every tool and skill (MCP tools keep their exposure)",

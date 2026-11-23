@@ -67,9 +67,9 @@ Set modes in the picker with `Space`, or from the command line:
 
 ```text
 /loadout mode codemode read grep find   # call only from codemode scripts
-/loadout mode deferred launchdarkly_*    # call from scripts, but leave unlisted
-/loadout mode direct mcp__linear__*     # declare these MCP tools directly
-/loadout mode off mcp__datadog__*       # turn off a whole MCP server
+/loadout mode deferred example_*        # call from scripts, but leave unlisted
+/loadout mode direct mcp__example__*    # declare these MCP tools directly
+/loadout mode off mcp__example__*       # turn off a whole MCP server
 /loadout mode off write                 # `hidden` is accepted as an alias
 ```
 
